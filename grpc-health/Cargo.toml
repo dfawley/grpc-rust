@@ -1,0 +1,23 @@
+[package]
+name = "grpc-health"
+version = "0.9.0-alpha.1"
+edition = "2024"
+authors = ["gRPC Authors"]
+license = "MIT"
+rust-version = { workspace = true }
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    "grpc::*",
+]
+
+[dependencies]
+grpc = {path = "../grpc", features = ["experimental_producer"] }
+protobuf = { version = "4.34.0-release" }
+grpc-protobuf = {path = "../grpc-protobuf"}
+
+[build-dependencies]
+grpc-protobuf-build = {path = "../grpc-protobuf-build"}
+
+[dev-dependencies]
+tokio = { version = "1.37.0", features = ["sync", "macros"] }

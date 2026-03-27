@@ -41,6 +41,7 @@ use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
+use crate::client::load_balancing::SubchannelUpdate;
 use crate::client::load_balancing::child_manager::ChildManager;
 use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::load_balancing::pick_first;
@@ -200,11 +201,11 @@ impl LbPolicy for RoundRobinPolicy {
     fn subchannel_update(
         &mut self,
         subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
+        update: &SubchannelUpdate,
         channel_controller: &mut dyn ChannelController,
     ) {
         self.child_manager
-            .subchannel_update(subchannel, state, channel_controller);
+            .subchannel_update(subchannel, update, channel_controller);
         self.update_picker(channel_controller);
     }
 
@@ -272,6 +273,7 @@ mod test {
     use crate::client::load_balancing::QueuingPicker;
     use crate::client::load_balancing::Subchannel;
     use crate::client::load_balancing::SubchannelState;
+    use crate::client::load_balancing::SubchannelUpdate;
     use crate::client::load_balancing::child_manager::ChildManager;
     use crate::client::load_balancing::pick_first;
     use crate::client::load_balancing::round_robin::RoundRobinPolicy;
@@ -394,7 +396,11 @@ mod test {
         state: &SubchannelState,
         tcc: &mut dyn ChannelController,
     ) {
-        lb_policy.subchannel_update(subchannel, state, tcc);
+        lb_policy.subchannel_update(
+            subchannel,
+            &SubchannelUpdate::ConnectivityUpdate(state.clone()),
+            tcc,
+        );
     }
 
     fn move_subchannel_to_transient_failure(
@@ -405,10 +411,7 @@ mod test {
     ) {
         lb_policy.subchannel_update(
             subchannel,
-            &SubchannelState {
-                connectivity_state: ConnectivityState::TransientFailure,
-                last_connection_error: Some(err.into()),
-            },
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::transient_failure(err)),
             tcc,
         );
     }
@@ -511,7 +514,11 @@ mod test {
             // resolver_update. It then sends a picker of the same state that
             // was passed to it.
             subchannel_update: Some(Arc::new(
-                |data: &mut StubPolicyData, subchannel, state, channel_controller| {
+                |data: &mut StubPolicyData, subchannel, update, channel_controller| {
+                    let SubchannelUpdate::ConnectivityUpdate(state) = update else {
+                        return;
+                    };
+
                     // Retrieve the specific TestState from the generic test_data field.
                     // This downcasts the `Any` trait object
                     let test_data = data.test_data.as_mut().unwrap(); // ? ignore?
@@ -521,30 +528,26 @@ mod test {
                         scl.contains(&subchannel),
                         "subchannel_update received an update for a subchannel it does not own."
                     );
-                    test_state.connectivity_state = state.connectivity_state;
-                    match state.connectivity_state {
+                    test_state.connectivity_state = state.connectivity_state();
+                    match state.connectivity_state() {
                         ConnectivityState::Ready => {
                             channel_controller.update_picker(LbState {
-                                connectivity_state: state.connectivity_state,
+                                connectivity_state: ConnectivityState::Ready,
                                 picker: Arc::new(OneSubchannelPicker { sc: subchannel }),
                             });
                         }
                         ConnectivityState::Idle => {}
                         ConnectivityState::Connecting => {
                             channel_controller.update_picker(LbState {
-                                connectivity_state: state.connectivity_state,
+                                connectivity_state: ConnectivityState::Connecting,
                                 picker: Arc::new(QueuingPicker {}),
                             });
                         }
                         ConnectivityState::TransientFailure => {
                             channel_controller.update_picker(LbState {
-                                connectivity_state: state.connectivity_state,
+                                connectivity_state: ConnectivityState::TransientFailure,
                                 picker: Arc::new(FailingPicker {
-                                    error: state
-                                        .last_connection_error
-                                        .as_ref()
-                                        .unwrap()
-                                        .to_string(),
+                                    error: state.last_connection_error().as_ref().unwrap().clone(),
                                 }),
                             });
                         }
@@ -1309,10 +1312,26 @@ mod test {
         endpoints.addresses.reverse();
         send_resolver_update_to_policy(&mut lb_policy, vec![endpoints], tcc);
         let subchannels = verify_subchannel_creation(&mut rx_events, 4);
-        lb_policy.subchannel_update(subchannels[0].clone(), &SubchannelState::idle(), tcc);
-        lb_policy.subchannel_update(subchannels[1].clone(), &SubchannelState::idle(), tcc);
-        lb_policy.subchannel_update(subchannels[2].clone(), &SubchannelState::idle(), tcc);
-        lb_policy.subchannel_update(subchannels[3].clone(), &SubchannelState::ready(), tcc);
+        lb_policy.subchannel_update(
+            subchannels[0].clone(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::idle()),
+            tcc,
+        );
+        lb_policy.subchannel_update(
+            subchannels[1].clone(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::idle()),
+            tcc,
+        );
+        lb_policy.subchannel_update(
+            subchannels[2].clone(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::idle()),
+            tcc,
+        );
+        lb_policy.subchannel_update(
+            subchannels[3].clone(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::ready()),
+            tcc,
+        );
         verify_ready_picker(&mut rx_events, subchannels[3].clone());
     }
 }

@@ -40,12 +40,22 @@ pub mod server;
 mod macros;
 mod status;
 
+pub use client::load_balancing::health_watcher::HealthSender;
+pub use client::load_balancing::health_watcher::HealthState;
+pub use client::load_balancing::health_watcher::HealthStreamRunner;
+pub use client::load_balancing::health_watcher::register_health_stream_runner;
 pub use status::ServerStatus;
 pub use status::Status;
 pub use status::StatusCode;
 
+#[cfg(feature = "experimental_name_resolution")]
+pub mod attributes;
+#[cfg(not(feature = "experimental_name_resolution"))]
 mod attributes;
 mod byte_str;
+#[cfg(feature = "experimental_runtime")]
+pub mod rt;
+#[cfg(not(feature = "experimental_runtime"))]
 mod rt;
 mod send_future;
 

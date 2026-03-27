@@ -23,6 +23,7 @@
  */
 
 use std::error::Error;
+use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -109,6 +110,12 @@ struct TonicTransport {
     grpc: Grpc<TonicService>,
     task_handle: BoxedTaskHandle,
     runtime: GrpcRuntime,
+}
+
+impl Debug for TonicTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TonicTransport{{...}}")
+    }
 }
 
 impl Drop for TonicTransport {

@@ -22,6 +22,8 @@
  *
  */
 
+//! Server-specific status types.
+
 use crate::status::Status;
 use crate::status::status_code::StatusCode;
 

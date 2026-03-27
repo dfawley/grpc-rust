@@ -23,6 +23,7 @@
  */
 
 use std::fmt::Display;
+use std::sync::Arc;
 use std::time::Instant;
 
 use tonic::async_trait;
@@ -32,17 +33,25 @@ use crate::core::RecvMessage;
 use crate::core::RequestHeaders;
 use crate::core::SendMessage;
 
-pub mod channel;
+mod channel;
 pub mod interceptor;
 pub mod metadata_utils;
 pub mod service_config;
 pub mod stream_util;
 
+#[cfg(feature = "experimental_load_balancing")]
+pub mod load_balancing;
+#[cfg(not(feature = "experimental_load_balancing"))]
+pub(crate) mod load_balancing;
+
+#[cfg(feature = "experimental_name_resolution")]
+pub mod name_resolution;
+#[cfg(not(feature = "experimental_name_resolution"))]
+pub(crate) mod name_resolution;
+
 pub use channel::Channel;
 pub use channel::ChannelOptions;
 
-pub(crate) mod load_balancing;
-pub(crate) mod name_resolution;
 mod subchannel;
 pub(crate) mod transport;
 
@@ -60,7 +69,7 @@ mod test_util;
 ///
 /// Channels may re-enter the Idle state if they are unused for longer than
 /// their configured idleness timeout.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Ord, PartialOrd)]
 pub enum ConnectivityState {
     #[default]
     Idle,
@@ -137,7 +146,7 @@ pub trait Invoke: Sync {
 }
 
 #[async_trait]
-pub trait DynInvoke: Send + Sync {
+pub(crate) trait DynInvoke: Send + Sync {
     async fn dyn_invoke(
         &self,
         headers: RequestHeaders,
@@ -145,15 +154,29 @@ pub trait DynInvoke: Send + Sync {
     ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>);
 }
 
-#[async_trait]
-impl<T: Invoke> DynInvoke for T {
-    async fn dyn_invoke(
+impl<T: DynInvoke> Invoke for T {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn invoke(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
-    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
-        let (tx, rx) = self.invoke(headers, options).await;
-        (Box::new(tx), Box::new(rx))
+    ) -> (Self::SendStream, Self::RecvStream) {
+        self.dyn_invoke(headers, options).await
+    }
+}
+
+impl Invoke for Arc<dyn DynInvoke> {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        (*self).dyn_invoke(headers, options).await
     }
 }
 

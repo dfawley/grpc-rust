@@ -23,6 +23,7 @@
  */
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
@@ -31,46 +32,113 @@ use std::ptr::addr_eq;
 use std::sync::Arc;
 use std::sync::Weak;
 
+use crate::Status;
+use crate::client::CallOptions;
 use crate::client::ConnectivityState;
+use crate::client::DynInvoke;
+use crate::client::Invoke;
 use crate::client::name_resolution::Address;
+use crate::client::stream_util::FailingRecvStream;
+use crate::client::stream_util::NopSendStream;
+use crate::client::subchannel::InternalSubchannel;
+use crate::core::RequestHeaders;
 
 /// Represents the current state of a Subchannel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct SubchannelState {
     /// The connectivity state of the subchannel.  See SubChannel for a
     /// description of the various states and their valid transitions.
-    pub(crate) connectivity_state: ConnectivityState,
+    connectivity_state: ConnectivityState,
     // Set if connectivity state is TransientFailure to describe the most recent
     // connection error.  None for any other connectivity_state value.
-    pub last_connection_error: Option<String>,
+    last_connection_error: Option<String>,
 }
 
 impl SubchannelState {
-    pub(crate) fn idle() -> Self {
+    pub fn idle() -> Self {
         Self {
             connectivity_state: ConnectivityState::Idle,
             last_connection_error: None,
         }
     }
 
-    pub(crate) fn ready() -> Self {
+    pub fn ready() -> Self {
         Self {
             connectivity_state: ConnectivityState::Ready,
             last_connection_error: None,
         }
     }
 
-    pub(crate) fn connecting() -> Self {
+    pub fn connecting() -> Self {
         Self {
             connectivity_state: ConnectivityState::Connecting,
             last_connection_error: None,
         }
     }
 
-    pub(crate) fn transient_failure(last_connection_error: impl Into<String>) -> Self {
+    pub fn transient_failure(last_connection_error: impl Into<String>) -> Self {
         Self {
             connectivity_state: ConnectivityState::TransientFailure,
             last_connection_error: Some(last_connection_error.into()),
+        }
+    }
+
+    pub fn connectivity_state(&self) -> ConnectivityState {
+        self.connectivity_state
+    }
+
+    pub fn last_connection_error(&self) -> &Option<String> {
+        &self.last_connection_error
+    }
+}
+
+struct FailingInvoker(Status);
+
+impl Invoke for FailingInvoker {
+    type SendStream = NopSendStream;
+    type RecvStream = FailingRecvStream;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        (NopSendStream, FailingRecvStream::new(self.0.clone()))
+    }
+}
+
+enum InvokerAttribute {
+    Internal(Arc<InternalSubchannel>),
+    Dynamic(Arc<dyn DynInvoke>),
+}
+
+impl Eq for InvokerAttribute {}
+
+impl PartialEq for InvokerAttribute {
+    fn eq(&self, other: &Self) -> bool {
+        addr_eq(self, other)
+    }
+}
+
+impl PartialOrd for InvokerAttribute {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for InvokerAttribute {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let self_addr = self as *const Self as usize;
+        let other_addr = other as *const Self as usize;
+        self_addr.cmp(&other_addr)
+    }
+}
+
+impl Debug for InvokerAttribute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Internal(arg0) => f.debug_tuple("InternalInvoker").field(arg0).finish(),
+            Self::Dynamic(arg0) => f.debug_tuple("DynamicInvoker").finish(),
         }
     }
 }
@@ -85,7 +153,7 @@ impl Display for SubchannelState {
     }
 }
 
-pub(crate) trait DynHash {
+pub trait DynHash {
     #[allow(clippy::redundant_allocation)]
     fn dyn_hash(&self, state: &mut Box<&mut dyn Hasher>);
 }
@@ -96,7 +164,7 @@ impl<T: Hash> DynHash for T {
     }
 }
 
-pub(crate) trait DynPartialEq {
+pub trait DynPartialEq {
     fn dyn_eq(&self, other: &&dyn Any) -> bool;
 }
 
@@ -118,7 +186,7 @@ pub(crate) mod private {
 ///
 /// - Subchannels start IDLE.
 ///
-/// - IDLE transitions to CONNECTING when connect() is called.
+/// - IDLE transitions to CONNECTING when [`Subchannel::connect`] is called.
 ///
 /// - CONNECTING transitions to READY on success or TRANSIENT_FAILURE on error.
 ///
@@ -130,9 +198,12 @@ pub(crate) mod private {
 ///
 /// When a Subchannel is dropped, it is disconnected automatically, and no
 /// subsequent state updates will be provided for it to the LB policy.
-pub(crate) trait Subchannel:
-    private::Sealed + DynHash + DynPartialEq + Any + Send + Sync
-{
+///
+/// Note that with other features like subchannel sharing and dynamic connection
+/// scaling, it is possible for subchannels to start in any state, to transition
+/// to CONNECTING from IDLE without calling [`Subchannel::connect`], or to make
+/// unexpected transitions between states, e.g. READY to CONNECTING.
+pub trait Subchannel: private::Sealed + DynHash + DynPartialEq + Any + Send + Sync {
     /// Returns the address of the Subchannel.
     /// TODO: Consider whether this should really be public.
     fn address(&self) -> Address;
@@ -176,7 +247,7 @@ impl Display for dyn Subchannel {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct WeakSubchannel(Weak<dyn Subchannel>);
 
 impl From<&Arc<dyn Subchannel>> for WeakSubchannel {
@@ -212,6 +283,18 @@ impl PartialEq for WeakSubchannel {
 }
 
 impl Eq for WeakSubchannel {}
+
+impl PartialOrd for WeakSubchannel {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WeakSubchannel {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.0.as_ptr() as *const () as usize).cmp(&(other.0.as_ptr() as *const () as usize))
+    }
+}
 
 pub(crate) trait ForwardingSubchannel: DynHash + DynPartialEq + Any + Send + Sync {
     fn delegate(&self) -> &Arc<dyn Subchannel>;

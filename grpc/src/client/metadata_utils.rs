@@ -22,6 +22,11 @@
  *
  */
 
+//! Utilities for manipulating metadata in client calls.
+//!
+//! This module provides interceptors for attaching and capturing metadata
+//! (headers and trailers) during client calls.
+
 use tokio::sync::oneshot;
 use tonic::metadata::MetadataMap;
 
@@ -97,6 +102,7 @@ impl<I: InvokeOnce> InterceptOnce<I> for CaptureHeadersInterceptor {
     }
 }
 
+/// A wrapper stream that captures headers and sends them to a channel.
 pub struct CaptureHeadersRecvStream<R> {
     rx: R,
     tx: Option<oneshot::Sender<MetadataMap>>,
@@ -148,6 +154,7 @@ impl<I: InvokeOnce> InterceptOnce<I> for CaptureTrailersInterceptor {
     }
 }
 
+/// A wrapper stream that captures trailers and sends them to a channel.
 pub struct CaptureTrailersRecvStream<R> {
     rx: R,
     tx: Option<oneshot::Sender<MetadataMap>>,

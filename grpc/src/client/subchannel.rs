@@ -23,6 +23,7 @@
  */
 
 use core::panic;
+use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
@@ -40,7 +41,6 @@ use tonic::async_trait;
 use crate::Status;
 use crate::StatusCode;
 use crate::client::CallOptions;
-use crate::client::ConnectivityState;
 use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
@@ -98,22 +98,12 @@ enum InternalSubchannelState {
 impl<'a> From<&'a InternalSubchannelState> for SubchannelState {
     fn from(iss: &'a InternalSubchannelState) -> SubchannelState {
         match &iss {
-            InternalSubchannelState::Idle => SubchannelState {
-                connectivity_state: ConnectivityState::Idle,
-                last_connection_error: None,
-            },
-            InternalSubchannelState::Connecting => SubchannelState {
-                connectivity_state: ConnectivityState::Connecting,
-                last_connection_error: None,
-            },
-            InternalSubchannelState::Ready(_) => SubchannelState {
-                connectivity_state: ConnectivityState::Ready,
-                last_connection_error: None,
-            },
-            InternalSubchannelState::TransientFailure(err) => SubchannelState {
-                connectivity_state: ConnectivityState::TransientFailure,
-                last_connection_error: Some(err.clone()),
-            },
+            InternalSubchannelState::Idle => SubchannelState::idle(),
+            InternalSubchannelState::Connecting => SubchannelState::connecting(),
+            InternalSubchannelState::Ready(_) => SubchannelState::ready(),
+            InternalSubchannelState::TransientFailure(err) => {
+                SubchannelState::transient_failure(err)
+            }
         }
     }
 }
@@ -258,11 +248,15 @@ struct InternalSubchannelData {
 impl InternalSubchannelData {
     fn update_state(&mut self, state: InternalSubchannelState) {
         self.state = state;
-        let state: SubchannelState = (&self.state).into();
+        let mut state: SubchannelState = (&self.state).into();
 
         let Some(subchannel) = self.weak_self.upgrade() else {
             return;
         };
+
+        // Attach the InternalSubchannel to the attributes to allow any wrapped
+        // child policy to access the raw subchannel for performing RPCs.
+        //////////////////////////TODO state.add_attribute(subchannel.clone());
 
         _ = self
             .work_queue
@@ -293,6 +287,30 @@ impl Hash for InternalSubchannel {
 impl PartialEq for InternalSubchannel {
     fn eq(&self, other: &Self) -> bool {
         addr_eq(self, other)
+    }
+}
+
+impl PartialOrd for InternalSubchannel {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for InternalSubchannel {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Cast references to thin pointers (usize) to compare addresses
+        let self_addr = self as *const Self as usize;
+        let other_addr = other as *const Self as usize;
+        self_addr.cmp(&other_addr)
+    }
+}
+
+impl Debug for InternalSubchannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InternalSubchannel")
+            .field("ptr", &format_args!("{:p}", self as *const Self))
+            .field("address", &self.address)
+            .finish()
     }
 }
 

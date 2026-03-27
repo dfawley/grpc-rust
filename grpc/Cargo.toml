@@ -28,6 +28,10 @@ _runtime-tokio = [
     "dep:socket2",
     "dep:tower",
 ]
+experimental_runtime = []
+experimental_name_resolution = ["experimental_runtime"]
+experimental_load_balancing = ["experimental_name_resolution"]
+experimental_producer = ["experimental_load_balancing"]
 # Used for testing with udeps as it wants this feature to exist
 # to be able to do its checks.
 tower = ["_runtime-tokio"]

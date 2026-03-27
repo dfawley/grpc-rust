@@ -41,10 +41,13 @@ use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
+use crate::client::load_balancing::SubchannelUpdate;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::ForwardingSubchannel;
 use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverUpdate;
+use crate::client::test_util::NopInvoker;
+use crate::client::transport::DynAdapter;
 use crate::core::RequestHeaders;
 
 pub(crate) fn new_request_headers() -> RequestHeaders {
@@ -97,6 +100,7 @@ impl PartialEq for TestSubchannel {
 }
 impl Eq for TestSubchannel {}
 
+#[derive(PartialEq, Eq)]
 pub(crate) enum TestEvent {
     NewSubchannel(Arc<dyn Subchannel>),
     UpdatePicker(LbState),
@@ -134,7 +138,9 @@ impl ChannelController for TestChannelController {
         self.tx_events
             .send(TestEvent::NewSubchannel(subchannel.clone()))
             .unwrap();
-        (subchannel, SubchannelState::idle())
+        let mut state = SubchannelState::idle();
+        //////////////////////////// TODO state.set_dyn_invoker(Arc::new(DynAdapter(NopInvoker)));
+        (subchannel, state)
     }
     fn update_picker(&mut self, update: LbState) {
         println!("picker_update called with {}", update.connectivity_state);
@@ -172,7 +178,7 @@ type ResolverUpdateFn = Arc<
 
 // The callback to invoke when subchannel_update is invoked on the stub policy.
 type SubchannelUpdateFn = Arc<
-    dyn Fn(&mut StubPolicyData, Arc<dyn Subchannel>, &SubchannelState, &mut dyn ChannelController)
+    dyn Fn(&mut StubPolicyData, Arc<dyn Subchannel>, &SubchannelUpdate, &mut dyn ChannelController)
         + Send
         + Sync,
 >;
@@ -239,11 +245,11 @@ impl LbPolicy for StubPolicy {
     fn subchannel_update(
         &mut self,
         subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
+        update: &SubchannelUpdate,
         channel_controller: &mut dyn ChannelController,
     ) {
         if let Some(f) = &self.funcs.subchannel_update {
-            f(&mut self.data, subchannel, state, channel_controller);
+            f(&mut self.data, subchannel, update, channel_controller);
         }
     }
 
@@ -274,6 +280,12 @@ impl StubPolicy {
 pub(crate) struct StubPolicyBuilder {
     name: &'static str,
     funcs: StubPolicyFuncs,
+}
+
+impl StubPolicyBuilder {
+    pub(crate) fn new(name: &'static str, funcs: StubPolicyFuncs) -> Self {
+        Self { name, funcs }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]

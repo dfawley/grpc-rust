@@ -33,6 +33,7 @@ use tonic::metadata::MetadataMap;
 
 use crate::Status;
 
+/// A trait for types that can be encoded into a gRPC message payload.
 #[allow(unused)]
 pub trait SendMessage: Send + Sync {
     fn encode(&self) -> Result<Box<dyn Buf + Send + Sync>, String>;
@@ -43,6 +44,7 @@ pub trait SendMessage: Send + Sync {
     }
 }
 
+/// A trait for types that can be decoded from a gRPC message payload.
 #[allow(unused)]
 pub trait RecvMessage: Send + Sync {
     fn decode(&mut self, data: &mut dyn Buf) -> Result<(), String>;

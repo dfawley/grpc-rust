@@ -35,6 +35,7 @@ use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
+use crate::client::load_balancing::SubchannelUpdate;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::child_manager::ChildManager;
 use crate::client::load_balancing::child_manager::ChildUpdate;
@@ -106,11 +107,11 @@ impl LbPolicy for GracefulSwitchPolicy {
     fn subchannel_update(
         &mut self,
         subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
+        update: &SubchannelUpdate,
         channel_controller: &mut dyn ChannelController,
     ) {
         self.child_manager
-            .subchannel_update(subchannel, state, channel_controller);
+            .subchannel_update(subchannel, update, channel_controller);
         self.update_picker(channel_controller);
     }
 
@@ -263,6 +264,7 @@ mod test {
     use crate::client::load_balancing::Picker;
     use crate::client::load_balancing::Subchannel;
     use crate::client::load_balancing::SubchannelState;
+    use crate::client::load_balancing::SubchannelUpdate;
     use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
     use crate::client::load_balancing::test_utils::StubPolicyData;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
@@ -361,6 +363,9 @@ mod test {
             // was passed to it.
             subchannel_update: Some(Arc::new(
                 move |data: &mut StubPolicyData, updated_subchannel, state, channel_controller| {
+                    let SubchannelUpdate::ConnectivityUpdate(state) = state else {
+                        return;
+                    };
                     // Retrieve the specific TestState from the generic test_data field.
                     // This downcasts the `Any` trait object.
                     let test_data = data.test_data.as_mut().unwrap();
@@ -371,7 +376,7 @@ mod test {
                         "subchannel_update received an update for a subchannel it does not own."
                     );
                     channel_controller.update_picker(LbState {
-                        connectivity_state: state.connectivity_state,
+                        connectivity_state: state.connectivity_state(),
                         picker: Arc::new(TestPicker { name }),
                     });
                 },
@@ -464,9 +469,9 @@ mod test {
         lb_policy: &mut impl LbPolicy,
         subchannel: Arc<dyn Subchannel>,
         tcc: &mut dyn ChannelController,
-        state: &SubchannelState,
+        update: &SubchannelUpdate,
     ) {
-        lb_policy.subchannel_update(subchannel, state, tcc);
+        lb_policy.subchannel_update(subchannel, update, tcc);
     }
 
     // Tests that the gracefulswitch policy correctly sets a child and sends
@@ -512,7 +517,7 @@ mod test {
             &mut graceful_switch,
             subchannel,
             tcc.as_mut(),
-            &SubchannelState::ready(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::ready()),
         );
         verify_correct_picker_from_policy(
             &mut rx_events,
@@ -563,7 +568,7 @@ mod test {
             &mut graceful_switch,
             subchannel,
             tcc.as_mut(),
-            &SubchannelState::ready(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::ready()),
         );
 
         // Assert picker is TestPickerOne by checking subchannel address
@@ -591,7 +596,7 @@ mod test {
             &mut graceful_switch,
             subchannel_two,
             tcc.as_mut(),
-            &SubchannelState::ready(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::ready()),
         );
         // Assert picker is TestPickerTwo by checking subchannel address
         verify_correct_picker_from_policy(
@@ -636,7 +641,7 @@ mod test {
             &mut graceful_switch,
             subchannel,
             tcc.as_mut(),
-            &SubchannelState::ready(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::ready()),
         );
         verify_correct_picker_from_policy(
             &mut rx_events,
@@ -726,7 +731,7 @@ mod test {
             &mut graceful_switch,
             second_subchannel,
             tcc.as_mut(),
-            &SubchannelState::ready(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::ready()),
         );
         verify_correct_picker_from_policy(
             &mut rx_events,
@@ -774,7 +779,7 @@ mod test {
             &mut graceful_switch,
             current_subchannel.clone(),
             tcc.as_mut(),
-            &SubchannelState::ready(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::ready()),
         );
         verify_correct_picker_from_policy(
             &mut rx_events,
@@ -804,7 +809,7 @@ mod test {
             &mut graceful_switch,
             pending_subchannel,
             tcc.as_mut(),
-            &SubchannelState::connecting(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::connecting()),
         );
         // This should not produce an update.
         assert_channel_empty(&mut rx_events);
@@ -812,7 +817,7 @@ mod test {
             &mut graceful_switch,
             current_subchannel,
             tcc.as_mut(),
-            &SubchannelState::connecting(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::connecting()),
         );
         verify_correct_picker_from_policy(
             &mut rx_events,
@@ -859,7 +864,7 @@ mod test {
             &mut graceful_switch,
             current_subchannel,
             tcc.as_mut(),
-            &SubchannelState::ready(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::ready()),
         );
         verify_correct_picker_from_policy(
             &mut rx_events,
@@ -889,7 +894,7 @@ mod test {
             &mut graceful_switch,
             pending_subchannel.clone(),
             tcc.as_mut(),
-            &SubchannelState::transient_failure("n/a"),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::transient_failure("n/a")),
         );
         verify_correct_picker_from_policy(
             &mut rx_events,
@@ -899,7 +904,7 @@ mod test {
             &mut graceful_switch,
             pending_subchannel,
             tcc.as_mut(),
-            &SubchannelState::connecting(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::connecting()),
         );
         verify_correct_picker_from_policy(
             &mut rx_events,
@@ -947,7 +952,7 @@ mod test {
             &mut graceful_switch,
             current_subchannel.clone(),
             tcc.as_mut(),
-            &SubchannelState::ready(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::ready()),
         );
         verify_correct_picker_from_policy(
             &mut rx_events,
@@ -976,7 +981,7 @@ mod test {
             &mut graceful_switch,
             pending_subchannel,
             tcc.as_mut(),
-            &SubchannelState::idle(),
+            &SubchannelUpdate::ConnectivityUpdate(SubchannelState::idle()),
         );
         verify_correct_picker_from_policy(
             &mut rx_events,

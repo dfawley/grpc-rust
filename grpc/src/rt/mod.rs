@@ -86,7 +86,7 @@ pub trait Runtime: Send + Sync + Debug {
 /// A future that resolves after a specified duration.
 pub trait Sleep: Send + Sync + Future<Output = ()> {}
 
-pub trait TaskHandle: Send + Sync {
+pub trait TaskHandle: Send + Sync + Debug {
     /// Abort the associated task.
     fn abort(&self);
 }
@@ -339,7 +339,7 @@ impl Runtime for NoOpRuntime {
     }
 }
 
-pub(crate) fn default_runtime() -> GrpcRuntime {
+pub fn default_runtime() -> GrpcRuntime {
     #[cfg(feature = "_runtime-tokio")]
     {
         return GrpcRuntime::new(tokio::TokioRuntime::default());

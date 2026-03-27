@@ -22,6 +22,11 @@
  *
  */
 
+//! gRPC client interceptors.
+//!
+//! This module provides traits and types to intercept and modify RPC calls,
+//! such as adding headers, logging, or implementing retries.
+
 use crate::client::CallOptions;
 use crate::client::Invoke;
 use crate::client::InvokeOnce;

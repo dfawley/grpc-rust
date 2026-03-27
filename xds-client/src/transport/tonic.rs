@@ -4,9 +4,6 @@
 //! to send and receive raw bytes, allowing the xDS client layer to handle
 //! serialization/deserialization independently.
 
-use crate::client::config::ServerConfig;
-use crate::error::{Error, Result};
-use crate::transport::{Transport, TransportBuilder, TransportStream};
 use bytes::{Buf, BufMut, Bytes};
 use http::uri::PathAndQuery;
 use tokio::sync::mpsc;
@@ -15,6 +12,10 @@ use tonic::client::Grpc;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::Channel;
 use tonic::{Status, Streaming};
+
+use crate::client::config::ServerConfig;
+use crate::error::{Error, Result};
+use crate::transport::{Transport, TransportBuilder, TransportStream};
 
 /// The gRPC path for the ADS StreamAggregatedResources RPC.
 const ADS_PATH: &str =
@@ -77,7 +78,6 @@ impl Decoder for BytesDecoder {
 }
 
 /// Factory for creating ADS streams using tonic.
-#[derive(Clone, Debug)]
 pub struct TonicTransport {
     channel: Channel,
 }
@@ -229,7 +229,9 @@ impl TransportStream for TonicAdsStream {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+
     use envoy_types::pb::envoy::service::discovery::v3::{
         DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
         aggregated_discovery_service_server::{
@@ -237,12 +239,12 @@ mod tests {
         },
     };
     use prost::Message;
-    use std::net::SocketAddr;
-    use std::pin::Pin;
     use tokio::net::TcpListener;
     use tokio_stream::Stream;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
+
+    use super::*;
 
     /// Mock ADS server that echoes back a response for each request.
     struct MockAdsServer;

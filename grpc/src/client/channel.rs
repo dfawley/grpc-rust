@@ -52,6 +52,7 @@ use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
+use crate::client::load_balancing::SubchannelUpdate;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
 use crate::client::load_balancing::pick_first;
@@ -87,11 +88,12 @@ use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 use crate::rt::default_runtime;
 
+/// Options for configuring a [`Channel`].
 #[non_exhaustive]
 pub struct ChannelOptions {
     pub transport_options: Attributes, // ?
     pub channel_authority: Option<String>,
-    pub connection_backoff: Option<TODO>,
+    pub connection_backoff: Option<()>, // TODO
     pub default_service_config: Option<String>,
     pub disable_proxy: bool,
     pub disable_service_config_lookup: bool,
@@ -118,7 +120,7 @@ pub struct ChannelOptions {
     // expressed through a trait that applies a mutation to a request.  We'd
     // apply all those mutations before the user's options so the user's options
     // would override the defaults, or so the defaults would occur first.
-    pub default_request_extensions: Vec<Box<TODO>>, // ??
+    pub default_request_extensions: Vec<Box<()>>, // TODO
 }
 
 impl Default for ChannelOptions {
@@ -139,7 +141,7 @@ impl Default for ChannelOptions {
 }
 
 impl ChannelOptions {
-    pub fn transport_options(self, transport_options: TODO) -> Self {
+    pub fn transport_options(self, transport_options: ()) -> Self {
         todo!(); // add to existing options.
     }
     pub fn override_authority(self, authority: impl Into<String>) -> Self {
@@ -153,6 +155,10 @@ impl ChannelOptions {
 
 // All of Channel needs to be thread-safe.  Arc<inner>?  Or give out
 // Arc<Channel> from constructor?
+/// A virtual, persistent connection to a service.
+///
+/// A `Channel` is the entry point for making RPCs. It manages connections,
+/// load balancing, and name resolution internally.
 #[derive(Clone)]
 pub struct Channel {
     inner: Arc<PersistentChannel>,
@@ -346,10 +352,13 @@ impl ActiveChannel {
                             .lb_policy
                             .work(&mut resolver_channel_controller.lb_channel_controller);
                     }
-                    WorkQueueItem::SubchannelStateUpdate { subchannel, state } => {
+                    WorkQueueItem::SubchannelStateUpdate {
+                        subchannel,
+                        state: update,
+                    } => {
                         resolver_channel_controller.lb_policy.subchannel_update(
                             subchannel,
-                            &state,
+                            &SubchannelUpdate::ConnectivityUpdate(update),
                             &mut resolver_channel_controller.lb_channel_controller,
                         );
                     }
@@ -557,8 +566,6 @@ pub(super) enum WorkQueueItem {
     // Call the resolver to resolve now.
     ResolveNow,
 }
-
-pub struct TODO;
 
 // Enables multiple receivers to view data output from a single producer.
 // Producer calls update.  Consumers call iter() and call next() until they find

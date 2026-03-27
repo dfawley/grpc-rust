@@ -35,6 +35,7 @@ use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::OneSubchannelPicker;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
+use crate::client::load_balancing::SubchannelUpdate;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverUpdate;
@@ -112,10 +113,14 @@ impl LbPolicy for PickFirstPolicy {
     fn subchannel_update(
         &mut self,
         subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
+        update: &SubchannelUpdate,
         channel_controller: &mut dyn ChannelController,
     ) {
-        match state.connectivity_state {
+        let SubchannelUpdate::ConnectivityUpdate(state) = update else {
+            return;
+        };
+
+        match state.connectivity_state() {
             // Assume the update is for our subchannel.
             ConnectivityState::Ready => {
                 channel_controller.update_picker(LbState {
@@ -129,7 +134,7 @@ impl LbPolicy for PickFirstPolicy {
                 channel_controller.update_picker(LbState {
                     connectivity_state: ConnectivityState::TransientFailure,
                     picker: Arc::new(FailingPicker {
-                        error: state.last_connection_error.clone().unwrap(),
+                        error: state.last_connection_error().clone().unwrap(),
                     }),
                 });
             }

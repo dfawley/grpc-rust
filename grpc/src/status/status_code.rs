@@ -22,6 +22,8 @@
  *
  */
 
+//! gRPC status codes.
+
 /// Represents a gRPC status code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]

@@ -36,6 +36,7 @@ use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::ParsedJsonLbConfig;
+use crate::client::load_balancing::SubchannelUpdate;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::name_resolution::ResolverUpdate;
@@ -128,11 +129,11 @@ impl<T: LbPolicy> LbPolicy for DynAdapter<T> {
     fn subchannel_update(
         &mut self,
         subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
+        update: &SubchannelUpdate,
         channel_controller: &mut dyn ChannelController,
     ) {
         self.0
-            .subchannel_update(subchannel, state, channel_controller);
+            .subchannel_update(subchannel, update, channel_controller);
     }
 
     fn work(&mut self, channel_controller: &mut dyn ChannelController) {

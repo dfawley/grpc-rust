@@ -22,6 +22,11 @@
  *
  */
 
+//! Stream utilities for gRPC clients.
+//!
+//! This module provides utilities for working with response streams,
+//! including protocol validation.
+
 use crate::Status;
 use crate::StatusCode;
 use crate::client::CallOptions;
@@ -166,7 +171,7 @@ where
     }
 }
 
-struct NopSendStream;
+pub(crate) struct NopSendStream;
 
 impl SendStream for NopSendStream {
     async fn send(&mut self, msg: &dyn SendMessage, options: SendOptions) -> Result<(), ()> {
@@ -197,6 +202,12 @@ impl FailingRecvStream {
                 status: Some(status),
             }),
         )
+    }
+
+    pub(crate) fn new(status: Status) -> Self {
+        Self {
+            status: Some(status),
+        }
     }
 }
 

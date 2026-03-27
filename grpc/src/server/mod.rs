@@ -22,6 +22,11 @@
  *
  */
 
+//! Server-side gRPC implementation.
+//!
+//! This module contains types for creating and running gRPC servers,
+//! handling incoming calls, and sending responses.
+
 use std::sync::Arc;
 
 use tonic::async_trait;
@@ -30,16 +35,21 @@ use crate::core::RecvMessage;
 use crate::core::RequestHeaders;
 use crate::core::ServerResponseStreamItem;
 
+/// A gRPC server.
+///
+/// The `Server` is used to register handlers and serve requests from a [`Listener`].
 pub struct Server {
     handler: Option<Arc<dyn DynHandle>>,
 }
 
+/// Represents an incoming RPC call on the server.
 pub struct Call<SS, RS> {
     pub headers: RequestHeaders,
     pub send: SS,
     pub recv: RS,
 }
 
+/// A trait for listening and accepting incoming gRPC calls.
 #[trait_variant::make(Send)]
 pub trait Listener {
     type SendStream: SendStream + 'static;
