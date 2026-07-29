@@ -40,6 +40,8 @@ pub mod manual;
 
 /// Service code generation for client
 mod client;
+/// Service code generation for client targeting `grpc` crate
+mod client_grpc;
 /// Service code generation for Server
 mod server;
 

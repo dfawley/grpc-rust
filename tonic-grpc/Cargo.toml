@@ -1,0 +1,25 @@
+[package]
+name = "tonic-grpc"
+version = "0.14.6"
+authors = ["gRPC authors"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/hyperium/tonic"
+homepage = "https://github.com/hyperium/tonic"
+description = "Bridge crate connecting tonic types and the grpc transport"
+readme = "README.md"
+categories = ["network-programming", "asynchronous"]
+keywords = ["rpc", "grpc", "prost", "protobuf", "tonic"]
+rust-version = { workspace = true }
+
+[dependencies]
+tonic = { version = "0.14.6", path = "../tonic", default-features = false }
+grpc = { path = "../grpc" }
+prost = "0.14"
+bytes = "1"
+tokio = { version = "1.0" }
+tokio-stream = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+

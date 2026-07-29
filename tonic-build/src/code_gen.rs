@@ -33,6 +33,13 @@ use proc_macro2::TokenStream;
 
 use crate::{Attributes, Service};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TargetCrate {
+    #[default]
+    Tonic,
+    Grpc,
+}
+
 /// Builder for the generic code generation of server and clients.
 #[derive(Debug)]
 pub struct CodeGenBuilder {
@@ -43,12 +50,25 @@ pub struct CodeGenBuilder {
     disable_comments: HashSet<String>,
     use_arc_self: bool,
     generate_default_stubs: bool,
+    target_crate: TargetCrate,
 }
 
 impl CodeGenBuilder {
     /// Create a new code gen builder with default options.
     pub fn new() -> Self {
         Default::default()
+    }
+
+    /// Enable code generation targeting the `grpc` crate instead of `tonic`.
+    pub fn target_grpc(&mut self) -> &mut Self {
+        self.target_crate = TargetCrate::Grpc;
+        self
+    }
+
+    /// Enable code generation targeting the `tonic` crate (default).
+    pub fn target_tonic(&mut self) -> &mut Self {
+        self.target_crate = TargetCrate::Tonic;
+        self
     }
 
     /// Enable code generation to emit the package name.
@@ -105,15 +125,26 @@ impl CodeGenBuilder {
     /// This takes some `Service` and will generate a `TokenStream` that contains
     /// a public module with the generated client.
     pub fn generate_client(&self, service: &impl Service, proto_path: &str) -> TokenStream {
-        crate::client::generate_internal(
-            service,
-            self.emit_package,
-            proto_path,
-            self.compile_well_known_types,
-            self.build_transport,
-            &self.attributes,
-            &self.disable_comments,
-        )
+        match self.target_crate {
+            TargetCrate::Tonic => crate::client::generate_internal(
+                service,
+                self.emit_package,
+                proto_path,
+                self.compile_well_known_types,
+                self.build_transport,
+                &self.attributes,
+                &self.disable_comments,
+            ),
+            TargetCrate::Grpc => crate::client_grpc::generate_internal(
+                service,
+                self.emit_package,
+                proto_path,
+                self.compile_well_known_types,
+                self.build_transport,
+                &self.attributes,
+                &self.disable_comments,
+            ),
+        }
     }
 
     /// Generate server code based on `Service`.
@@ -144,6 +175,7 @@ impl Default for CodeGenBuilder {
             disable_comments: HashSet::default(),
             use_arc_self: false,
             generate_default_stubs: false,
+            target_crate: TargetCrate::Tonic,
         }
     }
 }

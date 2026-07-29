@@ -49,6 +49,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 For further details how to use the generated client/server, see the [examples here](https://github.com/hyperium/tonic/tree/master/examples) or the Google APIs example below.
 
+## Generating Client Code for the `grpc` Crate
+
+`CodeGenBuilder` supports generating client stubs built on top of the `grpc`
+crate instead of Tonic's internal transport using `target_grpc()`.
+
+```rust,no_run,ignore
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_prost_build::configure()
+        .target_grpc()
+        .compile_protos(
+            &["proto/helloworld/helloworld.proto"],
+            &["proto/helloworld"],
+        )?;
+    Ok(())
+}
+```
+
+This enables existing Tonic applications to migrate to the `grpc` crate transport without changing message types or call-site invocation patterns.
+
+### Migrating to the `grpc` Crate
+
+For a step-by-step guide on migrating build scripts, channel creation, and Tower middleware to the `grpc` crate, see [tonic-migration.md](../tonic-migration.md).
+
+> **Note**: For new projects, the preferred method is to use native `grpc` code generation using `grpc-protobuf-build`. See the [gRPC Rust Documentation](https://grpc.io/docs/languages/rust/) for setup details.
+
 
 ## NixOS related hints
 

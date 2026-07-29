@@ -53,9 +53,6 @@
 #![doc(html_root_url = "https://docs.rs/tonic-prost-build/0.14.0")]
 #![doc(issue_tracker_base_url = "https://github.com/hyperium/tonic/issues/")]
 
-use proc_macro2::TokenStream;
-use prost_build::{Method, Service};
-use quote::{ToTokens, quote};
 use std::cell::RefCell;
 use std::{
     collections::HashSet,
@@ -63,19 +60,22 @@ use std::{
     io,
     path::{Path, PathBuf},
 };
+
+use proc_macro2::TokenStream;
+use prost_build::{Method, Service};
+use quote::{ToTokens, quote};
 use tonic_build::{Attributes, CodeGenBuilder};
 
 #[cfg(test)]
 mod tests;
 
 // Re-export core build functionality from tonic-build
-pub use tonic_build::{
-    Attributes as TonicAttributes, Method as TonicMethod, Service as TonicService, manual,
-};
-
 // Re-export prost types that users might need
 pub use prost_build::Config;
 pub use prost_types::FileDescriptorSet;
+pub use tonic_build::{
+    Attributes as TonicAttributes, Method as TonicMethod, Service as TonicService, manual,
+};
 
 /// Configure `tonic-prost-build` code generation.
 ///
@@ -110,6 +110,7 @@ pub fn configure() -> Builder {
         generate_default_stubs: false,
         codec_path: "tonic_prost::ProstCodec".to_string(),
         skip_debug: HashSet::default(),
+        target_grpc: false,
     }
 }
 
@@ -128,9 +129,31 @@ pub fn compile_protos(proto: impl AsRef<Path>) -> io::Result<()> {
     self::configure().compile_protos(&[proto_path], &[proto_dir])
 }
 
+/// Simple `.proto` compiling targeting the `grpc` crate. Use [`configure`] instead if you need more options.
+///
+/// The include directory will be the parent folder of the specified path.
+/// The package name will be the filename without the extension.
+pub fn compile_protos_grpc(proto: impl AsRef<Path>) -> io::Result<()> {
+    let proto_path: &Path = proto.as_ref();
+
+    // directory the main .proto file resides in
+    let proto_dir = proto_path
+        .parent()
+        .expect("proto file should reside in a directory");
+
+    self::configure()
+        .target_grpc()
+        .compile_protos(&[proto_path], &[proto_dir])
+}
+
 /// Simple file descriptor set compiling. Use [`configure`] instead if you need more options.
-pub fn compile_fds(fds: prost_types::FileDescriptorSet) -> io::Result<()> {
+pub fn compile_fds(fds: FileDescriptorSet) -> io::Result<()> {
     self::configure().compile_fds(fds)
+}
+
+/// Simple file descriptor set compiling targeting the `grpc` crate. Use [`configure`] instead if you need more options.
+pub fn compile_fds_grpc(fds: FileDescriptorSet) -> io::Result<()> {
+    self::configure().target_grpc().compile_fds(fds)
 }
 
 /// Extended list of Non-path Rust types allowed for request/response types.
@@ -353,6 +376,7 @@ struct ServiceGenerator {
     compile_well_known_types: bool,
     codec_path: String,
     disable_comments: HashSet<String>,
+    target_grpc: bool,
 }
 
 impl ServiceGenerator {
@@ -370,6 +394,7 @@ impl ServiceGenerator {
         compile_well_known_types: bool,
         codec_path: String,
         disable_comments: HashSet<String>,
+        target_grpc: bool,
     ) -> Self {
         ServiceGenerator {
             build_client,
@@ -383,6 +408,7 @@ impl ServiceGenerator {
             compile_well_known_types,
             codec_path,
             disable_comments,
+            target_grpc,
         }
     }
 }
@@ -399,6 +425,10 @@ impl prost_build::ServiceGenerator for ServiceGenerator {
             .disable_comments(self.disable_comments.clone())
             .use_arc_self(self.use_arc_self)
             .generate_default_stubs(self.generate_default_stubs);
+
+        if self.target_grpc {
+            builder.target_grpc();
+        }
 
         let mut tokens = TokenStream::new();
 
@@ -450,9 +480,21 @@ pub struct Builder {
     generate_default_stubs: bool,
     codec_path: String,
     skip_debug: HashSet<String>,
+    target_grpc: bool,
 }
 
 impl Builder {
+    /// Enable code generation targeting the `grpc` crate instead of `tonic`.
+    pub fn target_grpc(mut self) -> Self {
+        self.target_grpc = true;
+        self
+    }
+
+    /// Enable code generation targeting the `tonic` crate (default).
+    pub fn target_tonic(mut self) -> Self {
+        self.target_grpc = false;
+        self
+    }
     /// Enable or disable gRPC client code generation.
     pub fn build_client(mut self, enable: bool) -> Self {
         self.build_client = enable;
@@ -855,6 +897,7 @@ impl Builder {
                 self.compile_well_known_types,
                 self.codec_path.clone(),
                 self.disable_comments,
+                self.target_grpc,
             );
 
             config.service_generator(Box::new(service_generator));
@@ -957,6 +1000,7 @@ impl Builder {
                 self.compile_well_known_types,
                 self.codec_path.clone(),
                 self.disable_comments,
+                self.target_grpc,
             );
 
             config.service_generator(Box::new(service_generator));
@@ -982,6 +1026,7 @@ impl Builder {
             self.compile_well_known_types,
             self.codec_path.clone(),
             self.disable_comments,
+            self.target_grpc,
         ))
     }
 }

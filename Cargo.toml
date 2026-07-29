@@ -8,6 +8,7 @@ members = [
   "tonic-reflection",
   "tonic-prost",
   "tonic-prost-build",
+  "tonic-grpc",
   "tonic-web",
   "examples",
   "codegen",

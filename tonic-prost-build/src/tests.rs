@@ -24,6 +24,7 @@
 
 use super::*;
 use prost_build::{Comments, Method};
+use prost_types::{MethodOptions, ServiceOptions};
 use quote::quote;
 
 fn create_test_method(input_type: String, output_type: String) -> TonicBuildMethod {
@@ -339,4 +340,48 @@ fn test_edge_cases() {
     let (request, response) = method.request_response_name("super", false);
     assert_eq!(request.to_string(), "mypackage . ()");
     assert_eq!(response.to_string(), "mypackage . ()");
+}
+
+#[test]
+fn test_target_grpc_codegen() {
+    let service = Service {
+        name: "TestService".to_string(),
+        proto_name: "TestService".to_string(),
+        package: "test".to_string(),
+        comments: Comments {
+            leading: vec![],
+            trailing: vec![],
+            leading_detached: vec![],
+        },
+        methods: vec![Method {
+            name: "test_method".to_string(),
+            proto_name: "TestMethod".to_string(),
+            comments: Comments {
+                leading: vec![],
+                trailing: vec![],
+                leading_detached: vec![],
+            },
+            input_type: "TestRequest".to_string(),
+            output_type: "TestResponse".to_string(),
+            input_proto_type: "TestRequest".to_string(),
+            output_proto_type: "TestResponse".to_string(),
+            client_streaming: false,
+            server_streaming: false,
+            options: MethodOptions::default(),
+        }],
+        options: ServiceOptions::default(),
+    };
+
+    let tonic_service = TonicBuildService::new(service, "tonic_prost::ProstCodec".to_string());
+
+    let mut builder = CodeGenBuilder::new();
+    builder.target_grpc();
+    let tokens = builder.generate_client(&tonic_service, "super");
+    let code = tokens.to_string();
+
+    assert!(code.contains("pub struct TestServiceClient < T >"));
+    assert!(code.contains("pub fn with_interceptor"));
+    assert!(code.contains("T : grpc :: client :: Invoke"));
+    assert!(code.contains("with_metadata (grpc_md)"));
+    assert!(code.contains("InterceptedChannel"));
 }
