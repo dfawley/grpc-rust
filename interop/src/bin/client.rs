@@ -24,7 +24,6 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use grpc::credentials::LocalChannelCredentials;
 use grpc::credentials::rustls::RootCertificates;
@@ -35,9 +34,6 @@ use interop::client::InteropTest;
 use interop::client::InteropTestUnimplemented;
 use interop::client_prost;
 use interop::client_protobuf;
-use tonic::transport::Certificate;
-use tonic::transport::ClientTlsConfig;
-use tonic::transport::Endpoint;
 
 #[derive(Debug)]
 struct Opts {
@@ -90,26 +86,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box<dyn InteropTestUnimplemented>,
     ) = match matches.codec {
         Codec::Prost => {
-            let scheme = if matches.use_tls { "https" } else { "http" };
-            let mut endpoint = Endpoint::try_from(format!("{scheme}://localhost:10000"))?
-                .timeout(Duration::from_secs(5))
-                .concurrency_limit(30);
+            let channel = if matches.use_tls {
+                let _ = rustls::crypto::ring::default_provider().install_default();
 
-            if matches.use_tls {
                 let pem = std::fs::read_to_string("interop/data/ca.pem")?;
-                let ca = Certificate::from_pem(pem);
-                endpoint = endpoint.tls_config(
-                    ClientTlsConfig::new()
-                        .ca_certificate(ca)
-                        .domain_name("foo.test.google.fr"),
+                let root_certs = RootCertificates::from_pem(pem);
+                let creds = RustlsChannelCredentials::new(
+                    GrpcClientTlsConfig::new()
+                        .with_root_certificates_provider(StaticProvider::new(root_certs)),
                 )?;
-            }
-
-            let channel = endpoint.connect().await?;
+                grpc::client::Channel::builder("dns:///localhost:10000", Arc::new(creds))
+                    .authority("foo.test.google.fr")
+                    .build()
+            } else {
+                grpc::client::Channel::builder(
+                    "dns:///localhost:10000",
+                    Arc::new(LocalChannelCredentials::new()),
+                )
+                .build()
+            };
 
             (
-                Box::new(client_prost::TestClient::new(channel.clone())),
-                Box::new(client_prost::UnimplementedClient::new(channel)),
+                Box::new(client_prost::TestClient::new(tonic_grpc::InvokeService::new(
+                    channel.clone(),
+                ))),
+                Box::new(client_prost::UnimplementedClient::new(
+                    tonic_grpc::InvokeService::new(channel),
+                )),
             )
         }
         Codec::Protobuf => {

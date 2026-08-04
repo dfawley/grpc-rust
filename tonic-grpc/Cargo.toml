@@ -1,0 +1,29 @@
+[package]
+name = "tonic-grpc"
+version = "0.1.0"
+authors = ["gRPC authors"]
+categories = ["web-programming", "network-programming", "asynchronous"]
+description = """
+Adapter connecting Tonic clients to grpc::client::Invoke transports.
+"""
+edition = "2024"
+homepage = "https://github.com/hyperium/tonic"
+keywords = ["rpc", "grpc", "async", "futures"]
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/hyperium/tonic"
+rust-version = { workspace = true }
+
+[dependencies]
+tonic = { path = "../tonic" }
+grpc = { path = "../grpc" }
+tower-service = "0.3"
+http = "1.1"
+http-body = "1.0"
+http-body-util = "0.1"
+bytes = "1.0"
+futures = "0.3"
+tokio = { version = "1.0", features = ["sync"] }
+
+[lints]
+workspace = true

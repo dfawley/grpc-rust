@@ -27,14 +27,15 @@ use crate::{
     TestAssertion, pb::test_service_client::*, pb::unimplemented_service_client::*, pb::*,
     test_assert,
 };
+use grpc::client::Channel;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tonic::async_trait;
-use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status, metadata::MetadataValue};
+use tonic_grpc::InvokeService;
 
-pub type TestClient = TestServiceClient<Channel>;
-pub type UnimplementedClient = UnimplementedServiceClient<Channel>;
+pub type TestClient = TestServiceClient<InvokeService<Channel>>;
+pub type UnimplementedClient = UnimplementedServiceClient<InvokeService<Channel>>;
 
 const LARGE_REQ_SIZE: usize = 271_828;
 const LARGE_RSP_SIZE: i32 = 314_159;
