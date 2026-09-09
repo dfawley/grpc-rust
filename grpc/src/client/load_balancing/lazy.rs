@@ -34,11 +34,9 @@ use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
+use crate::client::load_balancing::WorkItem;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
-use crate::client::load_balancing::Subchannel;
-use crate::client::load_balancing::SubchannelState;
-use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::name_resolution::ResolverUpdate;
 
@@ -54,6 +52,7 @@ pub struct Lazy<T: LbPolicyBuilder> {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Inner<T: LbPolicyBuilder> {
     Void,
     Pending(Pending<T>),
@@ -111,20 +110,9 @@ where
         }
     }
 
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
+    fn work(&mut self, work: WorkItem, channel_controller: &mut dyn ChannelController) {
         if let Inner::Built(delegate) = &mut self.inner {
-            delegate.subchannel_update(subchannel, state, channel_controller);
-        }
-    }
-
-    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
-        if let Inner::Built(delegate) = &mut self.inner {
-            delegate.work(data, channel_controller);
+            delegate.work(work, channel_controller);
         } else {
             // The channel should only give us a work call if we asked for it
             // via the WakeUpPicker.
@@ -185,7 +173,7 @@ impl WakeUpPicker {
 impl Picker for WakeUpPicker {
     fn pick(&self, request: &RequestHeaders) -> PickResult {
         if !self.triggered_work.swap(true, Ordering::Relaxed) {
-            self.work_scheduler.schedule_work(None);
+            self.work_scheduler.schedule_work(WorkItem::WakeUp);
         }
         PickResult::Queue
     }
@@ -205,7 +193,6 @@ mod tests {
     enum MockEvent {
         Build,
         ResolverUpdate,
-        SubchannelUpdate,
         Work,
         ExitIdle,
     }
@@ -287,10 +274,10 @@ mod tests {
 
         // Picking should have scheduled work.
         let event = rx_events.recv().unwrap();
-        assert!(matches!(event, TestEvent::ScheduleWork(None)));
+        assert!(matches!(event, TestEvent::ScheduleWork(WorkItem::WakeUp)));
 
         // Call work on lazy to honor its request.
-        lazy.work(None, &mut cc);
+        lazy.work(WorkItem::WakeUp, &mut cc);
 
         // Verify delegate was built and received the pending update.
         assert_eq!(rx.recv().unwrap(), MockEvent::Build);
@@ -330,7 +317,7 @@ mod tests {
 
         // We should only receive a single ScheduleWork event.
         let event = rx_events.recv().unwrap();
-        assert!(matches!(event, TestEvent::ScheduleWork(None)));
+        assert!(matches!(event, TestEvent::ScheduleWork(WorkItem::WakeUp)));
 
         // There should be no more events in the channel.
         assert!(rx_events.try_recv().is_err());
@@ -400,10 +387,10 @@ mod tests {
 
         // Picking should have scheduled work.
         let event = rx_events.recv().unwrap();
-        assert!(matches!(event, TestEvent::ScheduleWork(None)));
+        assert!(matches!(event, TestEvent::ScheduleWork(WorkItem::WakeUp)));
 
         // Call work on lazy to honor its request.
-        lazy.work(None, &mut cc);
+        lazy.work(WorkItem::WakeUp, &mut cc);
 
         // Verify delegate was built and received an exit_idle call.
         assert_eq!(rx.recv().unwrap(), MockEvent::Build);
@@ -450,19 +437,7 @@ mod tests {
             self.tx.send(MockEvent::ResolverUpdate).unwrap();
             Ok(())
         }
-        fn subchannel_update(
-            &mut self,
-            _subchannel: Arc<dyn Subchannel>,
-            _state: &SubchannelState,
-            _channel_controller: &mut dyn ChannelController,
-        ) {
-            self.tx.send(MockEvent::SubchannelUpdate).unwrap();
-        }
-        fn work(
-            &mut self,
-            _work_data: Option<WorkData>,
-            _channel_controller: &mut dyn ChannelController,
-        ) {
+        fn work(&mut self, _work: WorkItem, _channel_controller: &mut dyn ChannelController) {
             self.tx.send(MockEvent::Work).unwrap();
         }
         fn exit_idle(&mut self, _channel_controller: &mut dyn ChannelController) {
