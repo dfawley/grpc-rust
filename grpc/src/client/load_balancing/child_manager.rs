@@ -39,11 +39,10 @@ use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
+use crate::client::load_balancing::LbWork;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
-use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
-use crate::client::load_balancing::subchannel::WeakSubchannel;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::core::Address;
 use crate::rt::GrpcRuntime;
@@ -51,7 +50,6 @@ use crate::rt::GrpcRuntime;
 // An LbPolicy implementation that manages multiple children.
 #[derive(Debug)]
 pub struct ChildManager<T: Debug, B: LbPolicyBuilder = Arc<DynLbPolicyBuilder>> {
-    subchannel_to_child_idx: HashMap<WeakSubchannel, usize>,
     handle_to_child_idx: HashMap<ChildHandle, usize>,
     children: Vec<Child<T, B>>,
     runtime: GrpcRuntime,
@@ -97,7 +95,6 @@ where
     /// resolver_update operation occurs.
     pub fn new(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
         Self {
-            subchannel_to_child_idx: Default::default(),
             handle_to_child_idx: Default::default(),
             children: Default::default(),
             runtime,
@@ -158,11 +155,6 @@ where
         channel_controller: WrappedController,
         child_idx: usize,
     ) {
-        // Add all created subchannels into the subchannel_child_map.
-        for csc in channel_controller.created_subchannels {
-            self.subchannel_to_child_idx
-                .insert((&csc).into(), child_idx);
-        }
         // Update the tracked state if the child produced an update.
         if let Some(state) = channel_controller.picker_update {
             self.children[child_idx].state = state;
@@ -196,28 +188,14 @@ where
         // Replace self.children with an empty vec.
         let old_children = mem::take(&mut self.children);
 
-        // Replace the subchannel map with an empty map.
-        let old_subchannel_child_map = mem::take(&mut self.subchannel_to_child_idx);
-
-        // Reverse the old subchannel map into a vector indexed by the old child ID.
-        let mut old_child_subchannels: Vec<Vec<WeakSubchannel>> = Vec::new();
-        old_child_subchannels.resize_with(old_children.len(), Vec::new);
-
-        for (subchannel, old_idx) in old_subchannel_child_map {
-            old_child_subchannels[old_idx].push(subchannel);
-        }
-
         // Build a map of the old children from their IDs for efficient lookups.
-        // This leverages a Child<usize> to hold all the entries where the
-        // identifier becomes the index within the old self.children vector.
         let mut old_children: HashMap<(&'static str, T), _> = old_children
             .into_iter()
-            .enumerate()
-            .map(|(old_idx, e)| {
+            .map(|e| {
                 (
                     (e.builder.name(), e.identifier),
                     Child {
-                        identifier: old_idx,
+                        identifier: (),
                         policy: e.policy,
                         builder: e.builder,
                         state: e.state,
@@ -231,17 +209,11 @@ where
         self.handle_to_child_idx.clear();
 
         // Transfer children whose identifiers appear before and after the
-        // update, and create new children.  Add entries back into the
-        // subchannel map.
+        // update, and create new children.
         for (identifier, builder) in ids_builders {
             let k = (builder.name(), identifier);
             if let Some(old_child) = old_children.remove(&k) {
-                let old_idx = old_child.identifier;
                 let new_child_idx = self.children.len();
-                for subchannel in mem::take(&mut old_child_subchannels[old_idx]) {
-                    self.subchannel_to_child_idx
-                        .insert(subchannel, new_child_idx);
-                }
                 self.handle_to_child_idx
                     .insert(old_child.work_scheduler.handle.clone(), new_child_idx);
                 self.children.push(Child {
@@ -361,31 +333,10 @@ where
         }
     }
 
-    /// Forwards the incoming subchannel_update to the child that created the
-    /// subchannel being updated.
-    pub fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        // Determine which child created this subchannel.
-        let child_idx = *self
-            .subchannel_to_child_idx
-            .get(&WeakSubchannel::new(&subchannel))
-            .unwrap();
-        let policy = &mut self.children[child_idx].policy;
-        // Wrap the channel_controller to track the child's operations.
-        let mut channel_controller = WrappedController::new(channel_controller);
-        // Call the proper child.
-        policy.subchannel_update(subchannel, state, &mut channel_controller);
-        self.resolve_child_controller(channel_controller, child_idx);
-    }
-
     /// Calls work on any children that scheduled work via the work scheduler.
-    pub fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
-        let Some(data) = data else {
-            debug_assert!(false, "ChildManager::work called with None value");
+    pub fn work(&mut self, work: LbWork, channel_controller: &mut dyn ChannelController) {
+        let LbWork::Data(data) = work else {
+            debug_assert!(false, "ChildManager::work called with unexpected work: {work:?}");
             return;
         };
         let child_work_item = match data.downcast::<ChildWorkItem>() {
@@ -403,7 +354,7 @@ where
             let mut channel_controller = WrappedController::new(channel_controller);
             child
                 .policy
-                .work(child_work_item.data, &mut channel_controller);
+                .work(child_work_item.work, &mut channel_controller);
             self.resolve_child_controller(channel_controller, child_idx);
         }
     }
@@ -421,7 +372,6 @@ where
 
 struct WrappedController<'a> {
     channel_controller: &'a mut dyn ChannelController,
-    created_subchannels: Vec<Arc<dyn Subchannel>>,
     picker_update: Option<LbState>,
 }
 
@@ -429,17 +379,19 @@ impl<'a> WrappedController<'a> {
     fn new(channel_controller: &'a mut dyn ChannelController) -> Self {
         Self {
             channel_controller,
-            created_subchannels: vec![],
             picker_update: None,
         }
     }
 }
 
 impl ChannelController for WrappedController<'_> {
-    fn new_subchannel(&mut self, address: &Address) -> (Arc<dyn Subchannel>, SubchannelState) {
-        let (subchannel, state) = self.channel_controller.new_subchannel(address);
-        self.created_subchannels.push(subchannel.clone());
-        (subchannel, state)
+    fn new_subchannel(
+        &mut self,
+        address: &Address,
+        work_scheduler: Arc<dyn WorkScheduler>,
+    ) -> (Arc<dyn Subchannel>, SubchannelState) {
+        self.channel_controller
+            .new_subchannel(address, work_scheduler)
     }
 
     fn update_picker(&mut self, update: LbState) {
@@ -471,7 +423,7 @@ impl std::hash::Hash for ChildHandle {
 #[derive(Debug)]
 struct ChildWorkItem {
     handle: ChildHandle,
-    data: Option<WorkData>,
+    work: LbWork,
 }
 
 #[derive(Debug)]
@@ -481,12 +433,12 @@ struct ChildWorkScheduler {
 }
 
 impl WorkScheduler for ChildWorkScheduler {
-    fn schedule_work(&self, data: Option<WorkData>) {
-        let wrapped: Option<WorkData> = Some(Box::new(ChildWorkItem {
+    fn schedule_work(&self, work: LbWork) {
+        let wrapped = Box::new(ChildWorkItem {
             handle: self.handle.clone(),
-            data,
-        }));
-        self.work_scheduler.schedule_work(wrapped);
+            work,
+        });
+        self.work_scheduler.schedule_work(LbWork::Data(wrapped));
     }
 }
 
@@ -505,6 +457,7 @@ mod test {
     use crate::client::load_balancing::DynLbPolicyBuilder;
     use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
     use crate::client::load_balancing::LbState;
+    use crate::client::load_balancing::LbWork;
     use crate::client::load_balancing::QueuingPicker;
     use crate::client::load_balancing::Subchannel;
     use crate::client::load_balancing::SubchannelState;
@@ -599,11 +552,20 @@ mod test {
 
     fn move_subchannel_to_state(
         child_manager: &mut ChildManager<Endpoint>,
+        rx_events: &mut mpsc::Receiver<TestEvent>,
         subchannel: Arc<dyn Subchannel>,
         tcc: &mut dyn ChannelController,
         state: &SubchannelState,
     ) {
-        child_manager.subchannel_update(subchannel, state, tcc);
+        subchannel
+            .downcast_ref::<test_utils::TestSubchannel>()
+            .expect("subchannel must be TestSubchannel")
+            .update_state(state.clone(), subchannel.clone());
+        let work = match rx_events.recv().expect("expected ScheduleWork event") {
+            TestEvent::ScheduleWork(work) => work,
+            other => panic!("expected ScheduleWork, got {:?}", other),
+        };
+        child_manager.work(work, tcc);
     }
 
     // Verifies that the expected number of subchannels is created. Returns the
@@ -635,18 +597,21 @@ mod test {
                 move |data, update: ResolverUpdate, _, controller| {
                     assert_eq!(update.endpoints.iter().len(), 1);
                     let endpoint = update.endpoints.unwrap().pop().unwrap();
-                    let subchannel = controller.new_subchannel(&endpoint.addresses[0]);
+                    let _subchannel = controller.new_subchannel(
+                        &endpoint.addresses[0],
+                        data.lb_policy_options.work_scheduler.clone(),
+                    );
                     Ok(())
                 },
             )),
-            // Closure for subchannel_update. Sends a picker of the same state
-            // that was passed to it.
-            subchannel_update: Some(Arc::new(
-                move |data, updated_subchannel, state, controller| {
-                    controller.update_picker(LbState {
-                        connectivity_state: state.connectivity_state,
-                        picker: Arc::new(QueuingPicker {}),
-                    });
+            work: Some(Arc::new(
+                move |_data, work, controller| {
+                    if let LbWork::SubchannelUpdate(update) = work {
+                        controller.update_picker(LbState {
+                            connectivity_state: update.state.connectivity_state,
+                            picker: Arc::new(QueuingPicker {}),
+                        });
+                    }
                 },
             )),
             ..Default::default()
@@ -682,24 +647,28 @@ mod test {
         let mut subchannels = subchannels.into_iter();
         move_subchannel_to_state(
             &mut child_manager,
+            &mut rx_events,
             subchannels.next().unwrap(),
             tcc.as_mut(),
             &SubchannelState::transient_failure("n/a"),
         );
         move_subchannel_to_state(
             &mut child_manager,
+            &mut rx_events,
             subchannels.next().unwrap(),
             tcc.as_mut(),
             &SubchannelState::idle(),
         );
         move_subchannel_to_state(
             &mut child_manager,
+            &mut rx_events,
             subchannels.next().unwrap(),
             tcc.as_mut(),
             &SubchannelState::connecting(),
         );
         move_subchannel_to_state(
             &mut child_manager,
+            &mut rx_events,
             subchannels.next().unwrap(),
             tcc.as_mut(),
             &SubchannelState::ready(),
@@ -734,18 +703,21 @@ mod test {
         let mut subchannels = subchannels.into_iter();
         move_subchannel_to_state(
             &mut child_manager,
+            &mut rx_events,
             subchannels.next().unwrap(),
             tcc.as_mut(),
             &SubchannelState::transient_failure("n/a"),
         );
         move_subchannel_to_state(
             &mut child_manager,
+            &mut rx_events,
             subchannels.next().unwrap(),
             tcc.as_mut(),
             &SubchannelState::idle(),
         );
         move_subchannel_to_state(
             &mut child_manager,
+            &mut rx_events,
             subchannels.next().unwrap(),
             tcc.as_mut(),
             &SubchannelState::connecting(),
@@ -785,12 +757,14 @@ mod test {
         let mut subchannels = subchannels.into_iter();
         move_subchannel_to_state(
             &mut child_manager,
+            &mut rx_events,
             subchannels.next().unwrap(),
             tcc.as_mut(),
             &SubchannelState::transient_failure("n/a"),
         );
         move_subchannel_to_state(
             &mut child_manager,
+            &mut rx_events,
             subchannels.next().unwrap(),
             tcc.as_mut(),
             &SubchannelState::idle(),
@@ -826,12 +800,14 @@ mod test {
         let mut subchannels = subchannels.into_iter();
         move_subchannel_to_state(
             &mut child_manager,
+            &mut rx_events,
             subchannels.next().unwrap(),
             tcc.as_mut(),
             &SubchannelState::transient_failure("n/a"),
         );
         move_subchannel_to_state(
             &mut child_manager,
+            &mut rx_events,
             subchannels.next().unwrap(),
             tcc.as_mut(),
             &SubchannelState::transient_failure("n/a"),
@@ -873,7 +849,7 @@ mod test {
                     .contains_key(name)
                 {
                     stubdata.requested_work = true;
-                    data.lb_policy_options.work_scheduler.schedule_work(None);
+                    data.lb_policy_options.work_scheduler.schedule_work(LbWork::WakeUp);
                 }
                 Ok(())
             })),
@@ -947,9 +923,10 @@ mod test {
         };
         // Validate data indicates the child to call.
         {
-            let wrapped = data
-                .as_ref()
-                .unwrap()
+            let LbWork::Data(ref boxed_data) = data else {
+                panic!("expected LbWork::Data");
+            };
+            let wrapped = boxed_data
                 .downcast_ref::<super::ChildWorkItem>()
                 .unwrap();
             assert_eq!(wrapped.handle, child1_handle);
@@ -984,9 +961,10 @@ mod test {
         let mut child2_work = None;
 
         for work in works {
-            let handle = work
-                .as_ref()
-                .unwrap()
+            let LbWork::Data(ref boxed_data) = work else {
+                panic!("expected LbWork::Data");
+            };
+            let handle = boxed_data
                 .downcast_ref::<super::ChildWorkItem>()
                 .unwrap()
                 .handle

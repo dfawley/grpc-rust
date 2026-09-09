@@ -42,9 +42,9 @@ use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Pick;
 use crate::client::load_balancing::PickResult;
+use crate::client::load_balancing::LbWork;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
-use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
@@ -166,7 +166,7 @@ impl PickFirstPolicy {
             } else {
                 // Get a new subchannel handle from the controller if we don't
                 // have an existing one.
-                channel_controller.new_subchannel(&addr)
+                channel_controller.new_subchannel(&addr, self.work_scheduler.clone())
             };
 
             // Track the best candidate for immediate activation:
@@ -480,57 +480,8 @@ impl PickFirstPolicy {
         channel_controller.request_resolution();
         Err(err.clone())
     }
-}
 
-impl LbPolicy for PickFirstPolicy {
-    type LbConfig = PickFirstConfig;
-
-    fn resolver_update(
-        &mut self,
-        update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
-        channel_controller: &mut dyn ChannelController,
-    ) -> Result<(), String> {
-        self.timer = None;
-
-        // Reset steady state on new update
-        self.steady_state = None;
-
-        match update.endpoints {
-            Ok(endpoints) => {
-                let new_addresses = self.compile_address(endpoints, config, channel_controller);
-                // If we have no addresses, clear subchannels and set TRANSIENT_FAILURE.
-                if new_addresses.is_empty() {
-                    self.subchannels.clear();
-                    self.selected = None;
-                    self.set_transient_failure(
-                        channel_controller,
-                        Some("empty address list".to_string()),
-                    )?;
-                }
-
-                if let Some(ready_subchannel) =
-                    self.rebuild_subchannels(new_addresses, channel_controller)
-                {
-                    self.subchannel_activate(ready_subchannel, channel_controller);
-                } else {
-                    self.start_connection_pass(channel_controller);
-                }
-            }
-            Err(e) => {
-                let error = e.to_string();
-                if self.subchannels.is_empty()
-                    || self.connectivity_state == ConnectivityState::TransientFailure
-                {
-                    self.set_transient_failure(channel_controller, Some(error))?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn subchannel_update(
+    pub(crate) fn subchannel_update(
         &mut self,
         subchannel: Arc<dyn Subchannel>,
         state: &SubchannelState,
@@ -585,17 +536,75 @@ impl LbPolicy for PickFirstPolicy {
             }
         }
     }
+}
 
-    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
-        debug_assert!(data.is_none(), "expected no data but got {data:?}");
-        if self.connectivity_state == ConnectivityState::Idle {
-            // TODO: is it safe to assume any call to work() while idle means we
-            // should connect?
-            self.exit_idle(channel_controller);
-        } else if self.timer.as_ref().is_some_and(|t| t.expired()) {
-            // Advance frontier and trigger next connection.
-            if let Some(next_sc) = self.advance_frontier(false) {
-                self.trigger_subchannel_connection(next_sc, channel_controller);
+impl LbPolicy for PickFirstPolicy {
+    type LbConfig = PickFirstConfig;
+
+    fn resolver_update(
+        &mut self,
+        update: ResolverUpdate,
+        config: Option<&Self::LbConfig>,
+        channel_controller: &mut dyn ChannelController,
+    ) -> Result<(), String> {
+        self.timer = None;
+
+        // Reset steady state on new update
+        self.steady_state = None;
+
+        match update.endpoints {
+            Ok(endpoints) => {
+                let new_addresses = self.compile_address(endpoints, config, channel_controller);
+                // If we have no addresses, clear subchannels and set TRANSIENT_FAILURE.
+                if new_addresses.is_empty() {
+                    self.subchannels.clear();
+                    self.selected = None;
+                    self.set_transient_failure(
+                        channel_controller,
+                        Some("empty address list".to_string()),
+                    )?;
+                }
+
+                if let Some(ready_subchannel) =
+                    self.rebuild_subchannels(new_addresses, channel_controller)
+                {
+                    self.subchannel_activate(ready_subchannel, channel_controller);
+                } else {
+                    self.start_connection_pass(channel_controller);
+                }
+            }
+            Err(e) => {
+                let error = e.to_string();
+                if self.subchannels.is_empty()
+                    || self.connectivity_state == ConnectivityState::TransientFailure
+                {
+                    self.set_transient_failure(channel_controller, Some(error))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn work(&mut self, work: LbWork, channel_controller: &mut dyn ChannelController) {
+        match work {
+            LbWork::SubchannelUpdate(update) => {
+                self.subchannel_update(update.subchannel, &update.state, channel_controller);
+            }
+            LbWork::WakeUp => {
+                if self.connectivity_state == ConnectivityState::Idle {
+                    // TODO: is it safe to assume any call to work() while idle means we
+                    // should connect?
+                    self.exit_idle(channel_controller);
+                } else if self.timer.as_ref().is_some_and(|t| t.expired()) {
+                    // Advance frontier and trigger next connection.
+                    if let Some(next_sc) = self.advance_frontier(false) {
+                        self.trigger_subchannel_connection(next_sc, channel_controller);
+                    }
+                }
+            }
+            LbWork::Data(_) => {
+                debug_assert!(false, "unexpected work data for pick_first");
             }
         }
     }
@@ -620,7 +629,7 @@ impl Timer {
         let handle = runtime.clone().spawn(Box::pin(async move {
             runtime.sleep(std::time::Duration::from_millis(250)).await;
             expired_clone.store(true, Ordering::SeqCst);
-            work_scheduler.schedule_work(None);
+            work_scheduler.schedule_work(LbWork::WakeUp);
         }));
         Self { expired, handle }
     }
@@ -670,7 +679,7 @@ impl IdlePicker {
 impl Picker for IdlePicker {
     fn pick(&self, _: &RequestHeaders) -> PickResult {
         if !self.triggered_work.swap(true, Ordering::Relaxed) {
-            self.work_scheduler.schedule_work(None);
+            self.work_scheduler.schedule_work(LbWork::WakeUp);
         }
         PickResult::Queue
     }
@@ -1222,7 +1231,7 @@ mod test {
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         // Manually call work() to process the timer expiration.
-        policy.work(None, controller.as_mut());
+        policy.work(LbWork::WakeUp, controller.as_mut());
 
         // Expect Connect event for addr2 due to timer expiration.
         let addr = expect_connect(&rx);
@@ -1498,7 +1507,7 @@ mod test {
             .unwrap()
             .expired
             .store(true, Ordering::SeqCst);
-        policy.work(None, controller.as_mut());
+        policy.work(LbWork::WakeUp, controller.as_mut());
 
         let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr2");
@@ -1615,7 +1624,7 @@ mod test {
         expect_schedule_work(&rx);
 
         // 6. Call work to execute the scheduled connection attempt.
-        policy.work(None, controller.as_mut());
+        policy.work(LbWork::WakeUp, controller.as_mut());
 
         // 7. Verify that the policy initiates a reconnection to addr1.
         let addr = expect_connect(&rx);

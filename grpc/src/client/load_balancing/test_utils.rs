@@ -29,7 +29,6 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::sync::Notify;
 
 use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
@@ -39,10 +38,10 @@ use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
+use crate::client::load_balancing::LbWork;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
-use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::ForwardingSubchannel;
 use crate::client::name_resolution::ResolverUpdate;
@@ -57,6 +56,7 @@ pub(crate) fn new_request_headers() -> RequestHeaders {
 pub(crate) struct TestSubchannel {
     address: Address,
     tx_connect: std::sync::mpsc::Sender<TestEvent>,
+    pub(crate) work_scheduler: Option<Arc<dyn WorkScheduler>>,
 }
 
 impl TestSubchannel {
@@ -64,6 +64,25 @@ impl TestSubchannel {
         Self {
             address,
             tx_connect,
+            work_scheduler: None,
+        }
+    }
+
+    pub fn new_with_scheduler(
+        address: Address,
+        tx_connect: std::sync::mpsc::Sender<TestEvent>,
+        work_scheduler: Arc<dyn WorkScheduler>,
+    ) -> Self {
+        Self {
+            address,
+            tx_connect,
+            work_scheduler: Some(work_scheduler),
+        }
+    }
+
+    pub fn update_state(&self, state: SubchannelState, self_arc: Arc<dyn Subchannel>) {
+        if let Some(ws) = &self.work_scheduler {
+            ws.schedule_subchannel_update(self_arc, state);
         }
     }
 }
@@ -103,7 +122,7 @@ pub(crate) enum TestEvent {
     UpdatePicker(LbState),
     RequestResolution,
     Connect(Address),
-    ScheduleWork(Option<WorkData>),
+    ScheduleWork(LbWork),
 }
 
 // TODO(easwars): Remove this and instead derive Debug.
@@ -127,11 +146,17 @@ pub(crate) struct TestChannelController {
 }
 
 impl ChannelController for TestChannelController {
-    fn new_subchannel(&mut self, address: &Address) -> (Arc<dyn Subchannel>, SubchannelState) {
+    fn new_subchannel(
+        &mut self,
+        address: &Address,
+        work_scheduler: Arc<dyn WorkScheduler>,
+    ) -> (Arc<dyn Subchannel>, SubchannelState) {
         println!("new_subchannel called for address {}", address);
-        let notify = Arc::new(Notify::new());
-        let subchannel: Arc<dyn Subchannel> =
-            Arc::new(TestSubchannel::new(address.clone(), self.tx_events.clone()));
+        let subchannel: Arc<dyn Subchannel> = Arc::new(TestSubchannel::new_with_scheduler(
+            address.clone(),
+            self.tx_events.clone(),
+            work_scheduler,
+        ));
         self.tx_events
             .send(TestEvent::NewSubchannel(subchannel.clone()))
             .unwrap();
@@ -154,8 +179,8 @@ pub(crate) struct TestWorkScheduler {
 }
 
 impl WorkScheduler for TestWorkScheduler {
-    fn schedule_work(&self, data: Option<WorkData>) {
-        self.tx_events.send(TestEvent::ScheduleWork(data)).unwrap();
+    fn schedule_work(&self, work: LbWork) {
+        self.tx_events.send(TestEvent::ScheduleWork(work)).unwrap();
     }
 }
 
@@ -171,24 +196,16 @@ type ResolverUpdateFn = Arc<
         + Sync,
 >;
 
-// The callback to invoke when subchannel_update is invoked on the stub policy.
-type SubchannelUpdateFn = Arc<
-    dyn Fn(&mut StubPolicyData, Arc<dyn Subchannel>, &SubchannelState, &mut dyn ChannelController)
-        + Send
-        + Sync,
->;
-
 type ExitIdleFn = Arc<dyn Fn(&mut StubPolicyData, &mut dyn ChannelController) + Send + Sync>;
 
 type WorkFn =
-    Arc<dyn Fn(&mut StubPolicyData, Option<WorkData>, &mut dyn ChannelController) + Send + Sync>;
+    Arc<dyn Fn(&mut StubPolicyData, LbWork, &mut dyn ChannelController) + Send + Sync>;
 
 /// This struct holds `LbPolicy` trait stub functions that tests are expected to
 /// implement.
 #[derive(Clone, Default)]
 pub(crate) struct StubPolicyFuncs {
     pub resolver_update: Option<ResolverUpdateFn>,
-    pub subchannel_update: Option<SubchannelUpdateFn>,
     pub exit_idle: Option<ExitIdleFn>,
     pub work: Option<WorkFn>,
 }
@@ -238,26 +255,15 @@ impl LbPolicy for StubPolicy {
         Ok(())
     }
 
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        if let Some(f) = &self.funcs.subchannel_update {
-            f(&mut self.data, subchannel, state, channel_controller);
-        }
-    }
-
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
         if let Some(f) = &self.funcs.exit_idle {
             f(&mut self.data, channel_controller);
         }
     }
 
-    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
+    fn work(&mut self, work: LbWork, channel_controller: &mut dyn ChannelController) {
         if let Some(f) = &self.funcs.work {
-            f(&mut self.data, data, channel_controller);
+            f(&mut self.data, work, channel_controller);
         }
     }
 }

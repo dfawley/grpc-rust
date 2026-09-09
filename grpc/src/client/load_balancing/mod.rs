@@ -100,18 +100,9 @@ pub trait LbPolicy: Send + Sync + Debug + 'static {
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String>;
 
-    /// Called by the channel when any subchannel created by the LB policy
-    /// changes state.
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    );
-
     /// Called by the channel in response to a call from the LB policy to the
-    /// WorkScheduler's request_work method.
-    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController);
+    /// WorkScheduler's request_work method, or to deliver subchannel updates.
+    fn work(&mut self, work: LbWork, channel_controller: &mut dyn ChannelController);
 
     /// Called by the channel when an LbPolicy goes idle and the channel
     /// wants it to start connecting to subchannels again.
@@ -168,14 +159,43 @@ impl dyn WorkDataTrait {
 /// associated policy's [`work`](LbPolicy::work) method.
 pub type WorkData = Box<dyn WorkDataTrait>;
 
+/// A subchannel connectivity state update.
+#[derive(Clone, Debug)]
+pub struct SubchannelUpdate {
+    pub subchannel: Arc<dyn Subchannel>,
+    pub state: SubchannelState,
+}
+
+impl SubchannelUpdate {
+    pub fn new(subchannel: Arc<dyn Subchannel>, state: SubchannelState) -> Self {
+        Self { subchannel, state }
+    }
+}
+
+/// Work item delivered to an [`LbPolicy`] through its [`work`](LbPolicy::work) method.
+#[derive(Debug)]
+pub enum LbWork {
+    SubchannelUpdate(SubchannelUpdate),
+    Data(WorkData),
+    WakeUp,
+}
+
 /// Used to asynchronously request a call into the LbPolicy's work method if
 /// the LbPolicy needs to provide an update without waiting for an update
-/// from the channel first.
+/// from the channel first, or to deliver subchannel updates.
 pub trait WorkScheduler: Send + Sync + Debug {
     // Schedules a call into the LbPolicy's work method.  If there is already a
     // pending work call that has not yet started, this may not schedule another
     // call.
-    fn schedule_work(&self, data: Option<WorkData>);
+    fn schedule_work(&self, work: LbWork);
+
+    /// Helper to schedule a subchannel state update.
+    fn schedule_subchannel_update(&self, subchannel: Arc<dyn Subchannel>, state: SubchannelState) {
+        self.schedule_work(LbWork::SubchannelUpdate(SubchannelUpdate {
+            subchannel,
+            state,
+        }));
+    }
 }
 
 /// Abstract representation of the configuration for any LB policy, stored as
@@ -220,7 +240,11 @@ impl ParsedJsonLbConfig {
 /// Controls channel behaviors.
 pub trait ChannelController: Send + Sync {
     /// Creates a new subchannel and returns its current state.
-    fn new_subchannel(&mut self, address: &Address) -> (Arc<dyn Subchannel>, SubchannelState);
+    fn new_subchannel(
+        &mut self,
+        address: &Address,
+        work_scheduler: Arc<dyn WorkScheduler>,
+    ) -> (Arc<dyn Subchannel>, SubchannelState);
 
     /// Provides a new snapshot of the LB policy's state to the channel.
     fn update_picker(&mut self, update: LbState);
@@ -443,17 +467,8 @@ impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
         (**self).resolver_update(update, config, channel_controller)
     }
 
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        (**self).subchannel_update(subchannel, state, channel_controller);
-    }
-
-    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
-        (**self).work(data, channel_controller);
+    fn work(&mut self, work: LbWork, channel_controller: &mut dyn ChannelController) {
+        (**self).work(work, channel_controller);
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {

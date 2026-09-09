@@ -23,11 +23,11 @@
  */
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 
 use crate::StatusCodeError;
 use crate::StatusError;
@@ -35,9 +35,10 @@ use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbState;
+use crate::client::load_balancing::LbWork;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
-use crate::client::load_balancing::WorkData;
+use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::ForwardingSubchannel;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
@@ -67,11 +68,47 @@ impl<T> SubchannelSharing<T> {
     }
 }
 
+type ExtSubchannelMap = HashMap<WeakSubchannel, Arc<dyn WorkScheduler>>;
+type SubchannelEntry = (SubchannelState, ExtSubchannelMap);
+
 #[derive(Debug)]
 struct Inner {
     subchannels_by_address: HashMap<Address, Arc<dyn Subchannel>>,
-    subchannels_int_to_ext:
-        HashMap<Arc<dyn Subchannel>, (SubchannelState, HashSet<WeakSubchannel>)>,
+    subchannels_int_to_ext: HashMap<Arc<dyn Subchannel>, SubchannelEntry>,
+}
+
+#[derive(Debug)]
+struct SharingWorkScheduler {
+    balancer_inner: Weak<Mutex<Inner>>,
+}
+
+impl WorkScheduler for SharingWorkScheduler {
+    fn schedule_work(&self, work: LbWork) {
+        let Some(inner) = self.balancer_inner.upgrade() else {
+            return;
+        };
+        if let LbWork::SubchannelUpdate(update) = work {
+            let mut inner = inner.lock().unwrap();
+            let Some((old_state, subchannel_map)) =
+                inner.subchannels_int_to_ext.get_mut(&update.subchannel)
+            else {
+                return;
+            };
+
+            *old_state = update.state.clone();
+
+            let targets: Vec<(Arc<dyn Subchannel>, Arc<dyn WorkScheduler>)> = subchannel_map
+                .iter()
+                .filter_map(|(weak, ws)| weak.upgrade().map(|sc| (sc, ws.clone())))
+                .collect();
+
+            drop(inner);
+
+            for (ext, ws) in targets {
+                ws.schedule_subchannel_update(ext, update.state.clone());
+            }
+        }
+    }
 }
 
 impl<T: LbPolicy> LbPolicy for SubchannelSharing<T> {
@@ -91,51 +128,12 @@ impl<T: LbPolicy> LbPolicy for SubchannelSharing<T> {
             .resolver_update(update, config, &mut channel_controller)
     }
 
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
+    fn work(&mut self, work: LbWork, channel_controller: &mut dyn ChannelController) {
         let mut channel_controller = SharingChannelController {
             balancer_inner: self.inner.clone(),
             delegate: channel_controller,
         };
-
-        let mut inner = self.inner.lock().unwrap();
-
-        // Call subchannel_update for every promotable SharedSubchannel for
-        // `subchannel`.  If things cannot be promoted they will be cleaned up
-        // by SubchannelSharing's Drop impl.
-        let Some((old_state, subchannel_set)) = inner.subchannels_int_to_ext.get_mut(&subchannel)
-        else {
-            return;
-        };
-
-        // Update the stored internal state for future subchannel creation.
-        *old_state = state.clone();
-
-        let ext_subchannels: Vec<_> = subchannel_set
-            .iter()
-            .filter_map(|weak| weak.upgrade())
-            .collect();
-
-        // Do not perform the outgoing calls with this lock held as it may need
-        // to be reacquired, e.g. if the delegate creates a new subchannel.
-        drop(inner);
-
-        for ext in ext_subchannels {
-            self.delegate
-                .subchannel_update(ext, state, &mut channel_controller)
-        }
-    }
-
-    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
-        let mut channel_controller = SharingChannelController {
-            balancer_inner: self.inner.clone(),
-            delegate: channel_controller,
-        };
-        self.delegate.work(data, &mut channel_controller);
+        self.delegate.work(work, &mut channel_controller);
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
@@ -191,7 +189,7 @@ impl Drop for SharedSubchannel {
         // Option<WeakSubchannel> for ourselves inside SharedSubchannel to allow
         // us to do something like `ext_subchannels.remove(&self.weak_self)`
         // (which would be constructed using Arc::new_cyclic).
-        ext_subchannels.retain(|weak| weak.strong_count() != 0);
+        ext_subchannels.retain(|weak, _| weak.strong_count() != 0);
         if ext_subchannels.is_empty() {
             // This is the last external subchannel using this internal
             // subchannel.  Drop the internal subchannel.
@@ -209,22 +207,30 @@ struct SharingChannelController<'a> {
 }
 
 impl<'a> ChannelController for SharingChannelController<'a> {
-    fn new_subchannel(&mut self, address: &Address) -> (Arc<dyn Subchannel>, SubchannelState) {
+    fn new_subchannel(
+        &mut self,
+        address: &Address,
+        work_scheduler: Arc<dyn WorkScheduler>,
+    ) -> (Arc<dyn Subchannel>, SubchannelState) {
         let mut inner = self.balancer_inner.lock().unwrap();
+        let (int_subchannel, initial_state) = if let Some(sc) = inner.subchannels_by_address.get(address) {
+            let sc = sc.clone();
+            let state = inner.subchannels_int_to_ext.get(&sc).unwrap().0.clone();
+            (sc, state)
+        } else {
+            // Drop inner lock before calling delegate.new_subchannel, as the
+            // subchannel initialization might synchronously notify the work_scheduler
+            // (e.g. move_to_idle), which locks inner.
+            drop(inner);
+            let balancer_inner = Arc::downgrade(&self.balancer_inner);
+            let sharing_ws = Arc::new(SharingWorkScheduler { balancer_inner });
+            let (new_sc, state) = self.delegate.new_subchannel(address, sharing_ws);
 
-        // Find the existing internal subchannel with this address, or create
-        // one and insert it into the map if one has not been created yet.
-        let mut new_state = None;
-        let int_subchannel = inner
-            .subchannels_by_address
-            .entry(address.clone())
-            .or_insert_with(|| {
-                let (new_sc, state) = self.delegate.new_subchannel(address);
-                new_state = Some(state);
-                new_sc
-            })
-            .clone();
-
+            inner = self.balancer_inner.lock().unwrap();
+            inner.subchannels_by_address.insert(address.clone(), new_sc.clone());
+            inner.subchannels_int_to_ext.insert(new_sc.clone(), (state.clone(), HashMap::new()));
+            (new_sc, state)
+        };
         let ext_subchannel: Arc<dyn Subchannel> = Arc::new(SharedSubchannel {
             delegate: int_subchannel.clone(),
             balancer_inner: self.balancer_inner.clone(),
@@ -234,12 +240,12 @@ impl<'a> ChannelController for SharingChannelController<'a> {
         // int->ext map.
         let entry = inner
             .subchannels_int_to_ext
-            .entry(int_subchannel)
-            .or_insert_with(|| (new_state.unwrap(), HashSet::new()));
+            .get_mut(&int_subchannel)
+            .expect("internal subchannel should exist in map");
 
-        entry.1.insert((&ext_subchannel).into());
+        entry.1.insert((&ext_subchannel).into(), work_scheduler);
 
-        (ext_subchannel, entry.0.clone())
+        (ext_subchannel, initial_state)
     }
 
     fn update_picker(&mut self, mut update: LbState) {
@@ -296,14 +302,16 @@ mod tests {
     use crate::client::ConnectivityState;
     use crate::client::load_balancing::LbPolicy;
     use crate::client::load_balancing::LbPolicyOptions;
+    use crate::client::load_balancing::LbWork;
     use crate::client::load_balancing::Pick;
     use crate::client::load_balancing::PickResult;
     use crate::client::load_balancing::Picker;
-    use crate::client::load_balancing::subchannel::SubchannelState;
+    use crate::client::load_balancing::SubchannelState;
     use crate::client::load_balancing::test_utils::StubPolicy;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEvent;
+    use crate::client::load_balancing::test_utils::TestSubchannel;
     use crate::client::load_balancing::test_utils::TestWorkScheduler;
     use crate::client::load_balancing::test_utils::new_request_headers;
     use crate::client::name_resolution::ResolverUpdate;
@@ -333,12 +341,14 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, _workitem, cc| {
+                work: Some(Arc::new(move |data, _workitem, cc| {
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
                     };
-                    let sc = cc.new_subchannel(&addr).0;
+                    let sc = cc
+                        .new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
+                        .0;
                     *sc_out_clone.lock().unwrap() = Some(sc);
                 })),
                 ..Default::default()
@@ -348,7 +358,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
 
         let event = rx_events.recv().unwrap();
         let TestEvent::NewSubchannel(internal_sc) = event else {
@@ -377,13 +387,14 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, _workitem, cc| {
+                work: Some(Arc::new(move |data, _workitem, cc| {
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
                     };
-                    *sc_out1_clone.lock().unwrap() = Some(cc.new_subchannel(&addr).0);
-                    *sc_out2_clone.lock().unwrap() = Some(cc.new_subchannel(&addr).0);
+                    let ws = data.lb_policy_options.work_scheduler.clone();
+                    *sc_out1_clone.lock().unwrap() = Some(cc.new_subchannel(&addr, ws.clone()).0);
+                    *sc_out2_clone.lock().unwrap() = Some(cc.new_subchannel(&addr, ws).0);
                 })),
                 ..Default::default()
             },
@@ -392,7 +403,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
 
         // Confirm that only one new_subchannel was seen by the underlying
         // channel controller.
@@ -431,7 +442,7 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, _workitem, cc| {
+                work: Some(Arc::new(move |data, _workitem, cc| {
                     let addr1 = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
@@ -440,8 +451,9 @@ mod tests {
                         address: "127.0.0.2:80".to_string().into(),
                         ..Default::default()
                     };
-                    *sc_out1_clone.lock().unwrap() = Some(cc.new_subchannel(&addr1).0);
-                    *sc_out2_clone.lock().unwrap() = Some(cc.new_subchannel(&addr2).0);
+                    let ws = data.lb_policy_options.work_scheduler.clone();
+                    *sc_out1_clone.lock().unwrap() = Some(cc.new_subchannel(&addr1, ws.clone()).0);
+                    *sc_out2_clone.lock().unwrap() = Some(cc.new_subchannel(&addr2, ws).0);
                 })),
                 ..Default::default()
             },
@@ -450,7 +462,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
 
         // Verify that two new_subchannel calls occurred.
         let event1 = rx_events.recv().unwrap();
@@ -472,6 +484,7 @@ mod tests {
 
     // Tests that when subchannels are dropped, they are removed from the
     // sharing map.
+    #[test]
     fn test_subchannel_cleanup_on_drop() {
         let (tx_events, rx_events) = mpsc::channel();
         let mut cc = TestChannelController {
@@ -493,22 +506,26 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, _workitem, cc| {
-                    let addr = Address {
-                        address: "127.0.0.1:80".to_string().into(),
-                        ..Default::default()
-                    };
-                    let mut num_calls = work_calls_clone.lock().unwrap();
-                    if *num_calls == 0 {
-                        *sc_out1_clone.lock().unwrap() = Some(cc.new_subchannel(&addr).0);
-                        *sc_out2_clone.lock().unwrap() = Some(cc.new_subchannel(&addr).0);
-                    } else if *num_calls == 1 {
-                        *sc_out3_clone.lock().unwrap() = Some(cc.new_subchannel(&addr).0);
+                work: Some(Arc::new(move |data, work, cc| match work {
+                    LbWork::SubchannelUpdate(_) => {
+                        *update_calls_clone.lock().unwrap() += 1;
                     }
-                    *num_calls += 1;
-                })),
-                subchannel_update: Some(Arc::new(move |_data, _sc, _state, _cc| {
-                    *update_calls_clone.lock().unwrap() += 1;
+                    _ => {
+                        let addr = Address {
+                            address: "127.0.0.1:80".to_string().into(),
+                            ..Default::default()
+                        };
+                        let ws = data.lb_policy_options.work_scheduler.clone();
+                        let mut num_calls = work_calls_clone.lock().unwrap();
+                        if *num_calls == 0 {
+                            *sc_out1_clone.lock().unwrap() =
+                                Some(cc.new_subchannel(&addr, ws.clone()).0);
+                            *sc_out2_clone.lock().unwrap() = Some(cc.new_subchannel(&addr, ws).0);
+                        } else if *num_calls == 1 {
+                            *sc_out3_clone.lock().unwrap() = Some(cc.new_subchannel(&addr, ws).0);
+                        }
+                        *num_calls += 1;
+                    }
                 })),
                 ..Default::default()
             },
@@ -518,7 +535,7 @@ mod tests {
         let mut sharing = SubchannelSharing::new(mock);
 
         // The first call to work should create sc1 and sc2.
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
         let _ = rx_events.recv().unwrap();
 
         let external_sc1 = sc_out1.lock().unwrap().take().unwrap();
@@ -533,7 +550,13 @@ mod tests {
 
         // Perform a subchannel update and confirm that two calls are made to
         // the delegate.
-        sharing.subchannel_update(internal_sc.clone(), &state, &mut cc);
+        internal_sc
+            .downcast_ref::<TestSubchannel>()
+            .unwrap()
+            .update_state(state.clone(), internal_sc.clone());
+        while let Ok(TestEvent::ScheduleWork(work)) = rx_events.try_recv() {
+            sharing.work(work, &mut cc);
+        }
         assert_eq!(*update_calls.lock().unwrap(), 2);
 
         // Drop one external subchannel.
@@ -541,7 +564,13 @@ mod tests {
 
         // Perform a subchannel update and confirm that only one call is made.
         *update_calls.lock().unwrap() = 0;
-        sharing.subchannel_update(internal_sc.clone(), &state, &mut cc);
+        internal_sc
+            .downcast_ref::<TestSubchannel>()
+            .unwrap()
+            .update_state(state.clone(), internal_sc.clone());
+        while let Ok(TestEvent::ScheduleWork(work)) = rx_events.try_recv() {
+            sharing.work(work, &mut cc);
+        }
         assert_eq!(*update_calls.lock().unwrap(), 1);
 
         // We should have 4 strong references to the internal subchannel: ours,
@@ -557,12 +586,18 @@ mod tests {
 
         // Perform a subchannel update and confirm zero calls are made.
         *update_calls.lock().unwrap() = 0;
-        sharing.subchannel_update(internal_sc.clone(), &state, &mut cc);
+        internal_sc
+            .downcast_ref::<TestSubchannel>()
+            .unwrap()
+            .update_state(state.clone(), internal_sc.clone());
+        while let Ok(TestEvent::ScheduleWork(work)) = rx_events.try_recv() {
+            sharing.work(work, &mut cc);
+        }
         assert_eq!(*update_calls.lock().unwrap(), 0);
 
         // Create a subchannel with the same address again and confirm that a
         // new underlying subchannel is created.
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
         let event = rx_events.recv().unwrap();
         assert!(matches!(event, TestEvent::NewSubchannel(_)));
 
@@ -592,16 +627,20 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, _workitem, cc| {
-                    let addr = Address {
-                        address: "127.0.0.1:80".to_string().into(),
-                        ..Default::default()
-                    };
-                    *sc_out1_clone.lock().unwrap() = Some(cc.new_subchannel(&addr).0);
-                    *sc_out2_clone.lock().unwrap() = Some(cc.new_subchannel(&addr).0);
-                })),
-                subchannel_update: Some(Arc::new(move |_data, _sc, _state, _cc| {
-                    *update_calls_clone.lock().unwrap() += 1;
+                work: Some(Arc::new(move |data, work, cc| match work {
+                    LbWork::SubchannelUpdate(_) => {
+                        *update_calls_clone.lock().unwrap() += 1;
+                    }
+                    _ => {
+                        let addr = Address {
+                            address: "127.0.0.1:80".to_string().into(),
+                            ..Default::default()
+                        };
+                        let ws = data.lb_policy_options.work_scheduler.clone();
+                        *sc_out1_clone.lock().unwrap() =
+                            Some(cc.new_subchannel(&addr, ws.clone()).0);
+                        *sc_out2_clone.lock().unwrap() = Some(cc.new_subchannel(&addr, ws).0);
+                    }
                 })),
                 ..Default::default()
             },
@@ -610,7 +649,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
         let _ = rx_events.recv().unwrap();
 
         let external_sc1 = sc_out1.lock().unwrap().take().unwrap();
@@ -624,12 +663,24 @@ mod tests {
         let state = SubchannelState::idle();
 
         // Verify that two delegated update calls are made.
-        sharing.subchannel_update(internal_sc.clone(), &state, &mut cc);
+        internal_sc
+            .downcast_ref::<TestSubchannel>()
+            .unwrap()
+            .update_state(state.clone(), internal_sc.clone());
+        while let Ok(TestEvent::ScheduleWork(work)) = rx_events.try_recv() {
+            sharing.work(work, &mut cc);
+        }
         assert_eq!(*update_calls.lock().unwrap(), 2);
 
         // Drop one and verify that one delegated update call is made.
         drop(external_sc1);
-        sharing.subchannel_update(internal_sc, &state, &mut cc);
+        internal_sc
+            .downcast_ref::<TestSubchannel>()
+            .unwrap()
+            .update_state(state, internal_sc.clone());
+        while let Ok(TestEvent::ScheduleWork(work)) = rx_events.try_recv() {
+            sharing.work(work, &mut cc);
+        }
         assert_eq!(*update_calls.lock().unwrap(), 3);
     }
 
@@ -647,12 +698,14 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, _workitem, cc| {
+                work: Some(Arc::new(move |data, _workitem, cc| {
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
                     };
-                    let sc = cc.new_subchannel(&addr).0;
+                    let sc = cc
+                        .new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
+                        .0;
                     *sc_out_clone.lock().unwrap() = Some(sc.clone());
 
                     #[derive(Debug)]
@@ -681,7 +734,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
         let _ = rx_events.recv().unwrap();
 
         let event = rx_events.recv().unwrap();
@@ -732,7 +785,6 @@ mod tests {
                     let called_clone = called.clone();
                     move |_data, _cc| called_clone.lock().unwrap().push("exit_idle")
                 })),
-                ..Default::default()
             },
             test_lb_policy_options(tx_events.clone()),
         );
@@ -741,7 +793,7 @@ mod tests {
 
         let update = ResolverUpdate::default();
         sharing.resolver_update(update, None, &mut cc).unwrap();
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
         sharing.exit_idle(&mut cc);
 
         assert_eq!(
@@ -767,21 +819,25 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, _workitem, cc| {
-                    let addr = Address {
-                        address: "127.0.0.1:80".to_string().into(),
-                        ..Default::default()
-                    };
-                    *sc_out1_clone.lock().unwrap() = Some(cc.new_subchannel(&addr).0);
-                })),
-                subchannel_update: Some(Arc::new(move |_data, _sc, _state, cc| {
-                    // Try to create a new subchannel while handling the update.
-                    // If the lock is held, this will deadlock!
-                    let addr = Address {
-                        address: "127.0.0.2:80".to_string().into(),
-                        ..Default::default()
-                    };
-                    cc.new_subchannel(&addr);
+                work: Some(Arc::new(move |data, work, cc| match work {
+                    LbWork::SubchannelUpdate(_) => {
+                        // Try to create a new subchannel while handling the update.
+                        // If the lock is held, this will deadlock!
+                        let addr = Address {
+                            address: "127.0.0.2:80".to_string().into(),
+                            ..Default::default()
+                        };
+                        let ws = data.lb_policy_options.work_scheduler.clone();
+                        cc.new_subchannel(&addr, ws);
+                    }
+                    _ => {
+                        let addr = Address {
+                            address: "127.0.0.1:80".to_string().into(),
+                            ..Default::default()
+                        };
+                        let ws = data.lb_policy_options.work_scheduler.clone();
+                        *sc_out1_clone.lock().unwrap() = Some(cc.new_subchannel(&addr, ws).0);
+                    }
                 })),
                 ..Default::default()
             },
@@ -790,7 +846,7 @@ mod tests {
 
         let mut sharing = SubchannelSharing::new(mock);
 
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
         let event = rx_events.recv().unwrap();
         let TestEvent::NewSubchannel(_int_sc) = event else {
             panic!("expected NewSubchannel")
@@ -805,7 +861,13 @@ mod tests {
 
         let state = SubchannelState::idle();
         // This should not deadlock.
-        sharing.subchannel_update(internal_sc.clone(), &state, &mut cc);
+        internal_sc
+            .downcast_ref::<TestSubchannel>()
+            .unwrap()
+            .update_state(state, internal_sc.clone());
+        while let Ok(TestEvent::ScheduleWork(work)) = rx_events.try_recv() {
+            sharing.work(work, &mut cc);
+        }
     }
 
     // Tests that a shared subchannel's correct state is returned by
@@ -817,15 +879,16 @@ mod tests {
             tx_events: tx_events.clone(),
         };
         let (tx_work, rx_work) =
-            mpsc::channel::<Box<dyn FnOnce(&mut dyn ChannelController) + Send>>();
+            mpsc::channel::<Box<dyn FnOnce(&mut dyn ChannelController, Arc<dyn WorkScheduler>) + Send>>();
         // Wrap rx_work in a mutex to allow the stub work Fn() closure to access
         // it mutably.
         let rx_work = Mutex::new(rx_work);
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |_data, _workitem, cc| {
-                    (rx_work.lock().unwrap().recv().unwrap())(cc);
+                work: Some(Arc::new(move |data, _workitem, cc| {
+                    let ws = data.lb_policy_options.work_scheduler.clone();
+                    (rx_work.lock().unwrap().recv().unwrap())(cc, ws);
                 })),
                 ..Default::default()
             },
@@ -845,13 +908,13 @@ mod tests {
         let sc1_clone = sc1.clone();
         let addr_clone = addr.clone();
         tx_work
-            .send(Box::new(move |cc| {
-                let (sc, state) = cc.new_subchannel(&addr_clone);
+            .send(Box::new(move |cc, ws| {
+                let (sc, state) = cc.new_subchannel(&addr_clone, ws);
                 assert_eq!(state.connectivity_state, ConnectivityState::Idle);
                 *sc1_clone.lock().unwrap() = Some(sc);
             }))
             .unwrap();
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
 
         let event = rx_events.recv().unwrap();
         let TestEvent::NewSubchannel(int_sc) = event else {
@@ -859,31 +922,39 @@ mod tests {
         };
 
         // Update the state to Connecting.
-        sharing.subchannel_update(int_sc.clone(), &SubchannelState::connecting(), &mut cc);
+        int_sc
+            .downcast_ref::<TestSubchannel>()
+            .unwrap()
+            .update_state(SubchannelState::connecting(), int_sc.clone());
+        while let Ok(TestEvent::ScheduleWork(_)) = rx_events.try_recv() {}
 
         // Create a second subchannel for the address and verify that the state
         // is also Connecting.
         let addr_clone = addr.clone();
         tx_work
-            .send(Box::new(move |cc| {
-                let (sc, state) = cc.new_subchannel(&addr_clone);
+            .send(Box::new(move |cc, ws| {
+                let (_sc, state) = cc.new_subchannel(&addr_clone, ws);
                 assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
             }))
             .unwrap();
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
 
         // Update the state to Ready.
-        sharing.subchannel_update(int_sc.clone(), &SubchannelState::ready(), &mut cc);
+        int_sc
+            .downcast_ref::<TestSubchannel>()
+            .unwrap()
+            .update_state(SubchannelState::ready(), int_sc.clone());
+        while let Ok(TestEvent::ScheduleWork(_)) = rx_events.try_recv() {}
 
         // Create another subchannel for the address and verify that the state
         // is now Ready.
         let addr_clone = addr.clone();
         tx_work
-            .send(Box::new(move |cc| {
-                let (sc, state) = cc.new_subchannel(&addr_clone);
+            .send(Box::new(move |cc, ws| {
+                let (_sc, state) = cc.new_subchannel(&addr_clone, ws);
                 assert_eq!(state.connectivity_state, ConnectivityState::Ready);
             }))
             .unwrap();
-        sharing.work(None, &mut cc);
+        sharing.work(LbWork::WakeUp, &mut cc);
     }
 }

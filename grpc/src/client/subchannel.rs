@@ -45,8 +45,7 @@ use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
 use crate::client::RequestHeaders;
-use crate::client::channel::WorkQueueItem;
-use crate::client::channel::WorkQueueTx;
+use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel::private::Sealed;
@@ -249,7 +248,7 @@ pub(crate) struct InternalSubchannel {
 struct InternalSubchannelData {
     address: Address,
     state: InternalSubchannelState,
-    work_queue: WorkQueueTx,
+    work_scheduler: Arc<dyn WorkScheduler>,
     on_drop: Arc<Notify>,
     transport_builder: Arc<dyn DynTransport>,
     backoff: Arc<dyn Backoff>,
@@ -268,9 +267,7 @@ impl InternalSubchannelData {
             return;
         };
 
-        _ = self
-            .work_queue
-            .send(WorkQueueItem::SubchannelStateUpdate { subchannel, state });
+        self.work_scheduler.schedule_subchannel_update(subchannel, state);
     }
 }
 
@@ -311,7 +308,7 @@ impl InternalSubchannel {
         backoff: Arc<dyn Backoff>,
         runtime: GrpcRuntime,
         mut security_opts: SecurityOpts,
-        work_queue: WorkQueueTx,
+        work_scheduler: Arc<dyn WorkScheduler>,
     ) -> Arc<dyn Subchannel> {
         let on_drop = Arc::new(Notify::new());
         if let Some(proxy_opts) = ProxyOptions::from_addr(&address) {
@@ -330,7 +327,7 @@ impl InternalSubchannel {
                 weak_self: weak_self.clone(),
                 runtime,
                 state: InternalSubchannelState::Idle,
-                work_queue,
+                work_scheduler,
                 on_drop,
                 transport_options: TransportOptions::default(), // TODO: should be configurable
                 security_opts,
