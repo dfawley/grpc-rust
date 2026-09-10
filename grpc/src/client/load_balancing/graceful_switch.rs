@@ -32,8 +32,8 @@ use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::LbWork;
 use crate::client::load_balancing::WorkScheduler;
-use crate::client::load_balancing::child_manager::ChildManager;
-use crate::client::load_balancing::child_manager::ChildUpdate;
+use crate::client::load_balancing::child_manager::ChildHandle;
+use crate::client::load_balancing::child_manager::ChildPolicy;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::rt::GrpcRuntime;
 
@@ -62,9 +62,59 @@ impl GracefulSwitchLbConfig {
 /// to active and tear down the previously active policy.
 #[derive(Debug)]
 pub struct GracefulSwitchPolicy {
-    child_manager: ChildManager<()>, // Child ID empty - only the name of the child LB policy matters.
-    last_update: Option<LbState>, // Saves the last output LbState to determine if an update is needed.
-    active_child_builder: Option<Arc<DynLbPolicyBuilder>>,
+    runtime: GrpcRuntime,
+    work_scheduler: Arc<dyn WorkScheduler>,
+    active: Option<ChildPolicy>,
+    pending: Option<ChildPolicy>,
+    last_update: Option<LbState>,
+}
+
+impl GracefulSwitchPolicy {
+    /// Creates a new Graceful Switch policy.
+    pub fn new(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
+        GracefulSwitchPolicy {
+            runtime,
+            work_scheduler,
+            active: None,
+            pending: None,
+            last_update: None,
+        }
+    }
+
+    fn update_picker(&mut self, channel_controller: &mut dyn ChannelController) {
+        let Some(update) = self.maybe_swap() else {
+            return;
+        };
+        if self.last_update.as_ref().is_some_and(|lu| lu == &update) {
+            return;
+        }
+        channel_controller.update_picker(update.clone());
+        self.last_update = Some(update);
+    }
+
+    // Determines the appropriate state to output
+    fn maybe_swap(&mut self) -> Option<LbState> {
+        let active = self.active.as_ref()?;
+
+        // If no pending child exists, we will update the active child's state.
+        let Some(pending) = &self.pending else {
+            return Some(active.state.clone());
+        };
+
+        // If the active child is still ready and the pending child is still
+        // connecting, keep using the active child's state.
+        if active.state.connectivity_state == ConnectivityState::Ready
+            && pending.state.connectivity_state == ConnectivityState::Connecting
+        {
+            return Some(active.state.clone());
+        }
+
+        // Transition to the pending child and remove the active child.
+        let pending = self.pending.take().unwrap();
+        let state = pending.state.clone();
+        self.active = Some(pending);
+        Some(state)
+    }
 }
 
 impl LbPolicy for GracefulSwitchPolicy {
@@ -77,130 +127,84 @@ impl LbPolicy for GracefulSwitchPolicy {
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         let config = config.ok_or("graceful switch received no config")?;
+        let (res, updated);
 
-        if self.active_child_builder.is_none() {
-            // When there are no children yet, the current update immediately
-            // becomes the active child.
-            self.active_child_builder = Some(config.child_builder.clone());
+        if let Some(active) = &mut self.active {
+            if active.builder.name() == config.child_builder.name() {
+                self.pending = None;
+                (res, updated) = active.resolver_update(
+                    update,
+                    config.child_config.as_ref(),
+                    channel_controller,
+                );
+            } else {
+                let pending = match &mut self.pending {
+                    Some(p) if p.builder.name() == config.child_builder.name() => p,
+                    _ => {
+                        self.pending = Some(ChildPolicy::new(
+                            config.child_builder.clone(),
+                            self.runtime.clone(),
+                            self.work_scheduler.clone(),
+                        ));
+                        self.pending.as_mut().unwrap()
+                    }
+                };
+                (res, updated) = pending.resolver_update(
+                    update,
+                    config.child_config.as_ref(),
+                    channel_controller,
+                );
+            }
+        } else {
+            let mut child = ChildPolicy::new(
+                config.child_builder.clone(),
+                self.runtime.clone(),
+                self.work_scheduler.clone(),
+            );
+            (res, updated) = child.resolver_update(
+                update,
+                config.child_config.as_ref(),
+                channel_controller,
+            );
+            self.active = Some(child);
         }
-        let active_child_builder = self.active_child_builder.as_ref().unwrap();
 
-        let mut children = Vec::with_capacity(2);
-
-        // Always include the incoming update.
-        children.push(ChildUpdate {
-            child_policy_builder: config.child_builder.clone(),
-            child_identifier: (),
-            child_update: Some((update, config.child_config.as_ref())),
-        });
-
-        // Include the active child if it does not match the updated child so
-        // that the child manager will not delete it.
-        if config.child_builder.name() != active_child_builder.name() {
-            children.push(ChildUpdate {
-                child_policy_builder: active_child_builder.clone(),
-                child_identifier: (),
-                child_update: None,
-            });
+        if updated {
+            self.update_picker(channel_controller);
         }
-
-        let res = self.child_manager.update(children, channel_controller);
-        self.update_picker(channel_controller);
         res
     }
 
     fn work(&mut self, work: LbWork, channel_controller: &mut dyn ChannelController) {
-        self.child_manager.work(work, channel_controller);
-        self.update_picker(channel_controller);
+        let Ok((handle, work)) = ChildHandle::unpack_work(work) else {
+            debug_assert!(false, "GracefulSwitchPolicy::work called with unexpected work");
+            return;
+        };
+
+        let updated = if let Some(active) = self.active.as_mut().filter(|a| a.handle() == &handle) {
+            active.work(work, channel_controller)
+        } else if let Some(pending) = self.pending.as_mut().filter(|p| p.handle() == &handle) {
+            pending.work(work, channel_controller)
+        } else {
+            false
+        };
+
+        if updated {
+            self.update_picker(channel_controller);
+        }
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
-        self.child_manager.exit_idle(channel_controller);
-        self.update_picker(channel_controller);
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-enum ChildKind {
-    Current,
-    Pending,
-}
-
-impl GracefulSwitchPolicy {
-    /// Creates a new Graceful Switch policy.
-    pub fn new(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
-        GracefulSwitchPolicy {
-            child_manager: ChildManager::new(runtime, work_scheduler),
-            last_update: None,
-            active_child_builder: None,
+        let mut updated = false;
+        if let Some(active) = &mut self.active {
+            updated |= active.exit_idle(channel_controller);
         }
-    }
-
-    fn update_picker(&mut self, channel_controller: &mut dyn ChannelController) {
-        // If maybe_swap returns a None, then no update needs to happen.
-        let Some(update) = self.maybe_swap(channel_controller) else {
-            return;
-        };
-        // If the current update is the same as the last update, skip it.
-        if self.last_update.as_ref().is_some_and(|lu| lu == &update) {
-            return;
+        if let Some(pending) = &mut self.pending {
+            updated |= pending.exit_idle(channel_controller);
         }
-        channel_controller.update_picker(update.clone());
-        self.last_update = Some(update);
-    }
-
-    // Determines the appropriate state to output
-    fn maybe_swap(&mut self, channel_controller: &mut dyn ChannelController) -> Option<LbState> {
-        // If no child updated itself, there is nothing we can do.
-        if !self.child_manager.child_updated() {
-            return None;
+        if updated {
+            self.update_picker(channel_controller);
         }
-
-        // If resolver_update has never been called, we have no children, so
-        // there's nothing we can do.
-        let Some(active_child_builder) = &self.active_child_builder else {
-            return None;
-        };
-        let active_name = active_child_builder.name();
-
-        // Scan through the child manager's children for the active and
-        // (optional) pending child.
-        let mut active_child = None;
-        let mut pending_child = None;
-        for child in self.child_manager.children() {
-            if child.builder.name() == active_name {
-                active_child = Some(child);
-            } else {
-                pending_child = Some(child);
-            }
-        }
-        let active_child = active_child.expect("There should always be an active child policy");
-
-        // If no pending child exists, we will update the active child's state.
-        let Some(pending_child) = pending_child else {
-            return Some(active_child.state.clone());
-        };
-
-        // If the active child is still reading and the pending child is still
-        // connecting, keep using the active child's state.
-        if active_child.state.connectivity_state == ConnectivityState::Ready
-            && pending_child.state.connectivity_state == ConnectivityState::Connecting
-        {
-            return Some(active_child.state.clone());
-        }
-
-        // Transition to the pending child and remove the active child.
-
-        // Clone some things from child_manager.children to release the
-        // child_manager reference.
-        let pending_child_builder = pending_child.builder.clone();
-        let pending_state = pending_child.state.clone();
-
-        self.active_child_builder = Some(pending_child_builder.clone());
-        self.child_manager
-            .retain_children([((), pending_child_builder)]);
-
-        Some(pending_state)
     }
 }
 
