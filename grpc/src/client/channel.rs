@@ -48,7 +48,7 @@ use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
-use crate::client::load_balancing::WorkData;
+use crate::client::load_balancing::WorkItem;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
@@ -329,17 +329,10 @@ impl ActiveChannel {
                         resolver.work(&mut resolver_channel_controller)
                     }
                     WorkQueueItem::ResolveNow => resolver.resolve_now(),
-                    WorkQueueItem::ScheduleLbPolicy(data) => {
+                    WorkQueueItem::ScheduleLbPolicy(work) => {
                         resolver_channel_controller
                             .lb_policy
-                            .work(data, &mut resolver_channel_controller.lb_channel_controller);
-                    }
-                    WorkQueueItem::SubchannelStateUpdate { subchannel, state } => {
-                        resolver_channel_controller.lb_policy.subchannel_update(
-                            subchannel,
-                            &state,
-                            &mut resolver_channel_controller.lb_channel_controller,
-                        );
+                            .work(work, &mut resolver_channel_controller.lb_channel_controller);
                     }
                 }
             }
@@ -477,7 +470,11 @@ struct LbChannelController {
 }
 
 impl load_balancing::ChannelController for LbChannelController {
-    fn new_subchannel(&mut self, address: &Address) -> (Arc<dyn Subchannel>, SubchannelState) {
+    fn new_subchannel(
+        &mut self,
+        address: &Address,
+        work_scheduler: Arc<dyn WorkScheduler>,
+    ) -> (Arc<dyn Subchannel>, SubchannelState) {
         let transport = self
             .transport_registry
             .get_transport(address.network_type)
@@ -489,7 +486,7 @@ impl load_balancing::ChannelController for LbChannelController {
                 Arc::new(NopBackoff {}),
                 self.runtime.clone(),
                 self.security_opts.clone(),
-                self.wqtx.clone(),
+                work_scheduler,
             ),
             SubchannelState::idle(),
         )
@@ -510,19 +507,14 @@ struct LbWorkScheduler {
 }
 
 impl WorkScheduler for LbWorkScheduler {
-    fn schedule_work(&self, data: Option<WorkData>) {
-        _ = self.wqtx.send(WorkQueueItem::ScheduleLbPolicy(data));
+    fn schedule_work(&self, work: WorkItem) {
+        _ = self.wqtx.send(WorkQueueItem::ScheduleLbPolicy(work));
     }
 }
 
 pub(super) enum WorkQueueItem {
     // Call the LB policy to do work.
-    ScheduleLbPolicy(Option<WorkData>),
-    // Provide the subchannel state update to the LB policy.
-    SubchannelStateUpdate {
-        subchannel: Arc<dyn Subchannel>,
-        state: SubchannelState,
-    },
+    ScheduleLbPolicy(WorkItem),
     // Call the resolver to do work.
     ScheduleResolver,
     // Call the resolver to resolve now.
