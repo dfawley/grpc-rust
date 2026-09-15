@@ -650,7 +650,11 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |data, _workitem, cc| {
+                work: Some(Arc::new(move |data, work_item, cc| {
+                    if let Some(Ok(_update)) = work_item.map(|d| d.downcast::<SubchannelUpdate>()) {
+                        *update_calls_clone.lock().unwrap() += 1;
+                        return;
+                    }
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
@@ -672,9 +676,6 @@ mod tests {
                         );
                     }
                     *num_calls += 1;
-                })),
-                subchannel_update: Some(Arc::new(move |_data, _sc, _state, _cc| {
-                    *update_calls_clone.lock().unwrap() += 1;
                 })),
                 ..Default::default()
             },
@@ -773,7 +774,11 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |data, _workitem, cc| {
+                work: Some(Arc::new(move |data, work_item, cc| {
+                    if let Some(Ok(_update)) = work_item.map(|d| d.downcast::<SubchannelUpdate>()) {
+                        *update_calls_clone.lock().unwrap() += 1;
+                        return;
+                    }
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
@@ -786,9 +791,6 @@ mod tests {
                         cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
                             .0,
                     );
-                })),
-                subchannel_update: Some(Arc::new(move |_data, _sc, _state, _cc| {
-                    *update_calls_clone.lock().unwrap() += 1;
                 })),
                 ..Default::default()
             },
@@ -964,13 +966,15 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |data, _workitem, cc| {
+                work: Some(Arc::new(move |data, work_item, cc| {
+                    if let Some(Ok(_update)) = work_item.map(|d| d.downcast::<SubchannelUpdate>()) {
+                        // Ignore subchannel state updates; they must not be routed to
+                        // the work func, which expects an entry in rx_work.
+                        return;
+                    }
                     let work_scheduler = data.lb_policy_options.work_scheduler.clone();
                     (rx_work.lock().unwrap().recv().unwrap())(cc, work_scheduler);
                 })),
-                // Ignore subchannel state updates; they must not be routed to
-                // the work func, which expects an entry in rx_work.
-                subchannel_update: Some(Arc::new(move |_data, _sc, _state, _cc| {})),
                 ..Default::default()
             },
             test_lb_policy_options(tx_events.clone()),
@@ -1101,7 +1105,11 @@ mod tests {
 
         let mock = StubPolicy::new(
             StubPolicyFuncs {
-                work: Some(Arc::new(move |data, _workitem, cc| {
+                work: Some(Arc::new(move |data, work_item, cc| {
+                    if let Some(Ok(update)) = work_item.map(|d| d.downcast::<SubchannelUpdate>()) {
+                        updates_clone.lock().unwrap().push(update.state.connectivity_state);
+                        return;
+                    }
                     let addr = Address {
                         address: "127.0.0.1:80".to_string().into(),
                         ..Default::default()
@@ -1112,9 +1120,6 @@ mod tests {
                         cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
                             .0,
                     );
-                })),
-                subchannel_update: Some(Arc::new(move |_data, _sc, state, _cc| {
-                    updates_clone.lock().unwrap().push(state.connectivity_state);
                 })),
                 ..Default::default()
             },

@@ -222,6 +222,7 @@ mod test {
     use crate::client::load_balancing::Subchannel;
     use crate::client::load_balancing::SubchannelState;
     use crate::client::load_balancing::WorkScheduler;
+    use crate::client::load_balancing::subchannel::SubchannelUpdate;
     use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
     use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
     use crate::client::load_balancing::test_utils::StubPolicyData;
@@ -301,7 +302,7 @@ mod test {
         subchannel_list: TestSubchannelList,
     }
 
-    // Defines the functions resolver_update and subchannel_update to test
+    // Defines the functions resolver_update and work to test
     // graceful switch.
     fn create_funcs_for_gracefulswitch_tests(name: &'static str) -> StubPolicyFuncs {
         StubPolicyFuncs {
@@ -330,23 +331,26 @@ mod test {
                     Ok(())
                 },
             )),
-            // Closure for subchannel_update. Verify that the subchannel that
-            // being updated now is the same one that this child policy created
-            // in resolver_update. It then sends a picker of the same state that
-            // was passed to it.
-            subchannel_update: Some(Arc::new(
-                move |data: &mut StubPolicyData, updated_subchannel, state, channel_controller| {
+            // Closure for work. Verify that the subchannel being updated now is
+            // the same one that this child policy created in resolver_update.
+            // It then sends a picker of the same state that was passed to it.
+            work: Some(Arc::new(
+                move |data: &mut StubPolicyData, work_data, channel_controller| {
+                    let update = work_data
+                        .expect("expected work data")
+                        .downcast::<SubchannelUpdate>()
+                        .expect("expected SubchannelUpdate");
                     // Retrieve the specific TestState from the generic test_data field.
                     // This downcasts the `Any` trait object.
                     let test_data = data.test_data.as_mut().unwrap();
                     let test_state = test_data.downcast_mut::<TestState>().unwrap();
                     let scl = &mut test_state.subchannel_list;
                     assert!(
-                        scl.contains(&updated_subchannel),
-                        "subchannel_update received an update for a subchannel it does not own."
+                        scl.contains(&update.subchannel),
+                        "work received an update for a subchannel it does not own."
                     );
                     channel_controller.update_picker(LbState {
-                        connectivity_state: state.connectivity_state,
+                        connectivity_state: update.state.connectivity_state,
                         picker: Arc::new(TestPicker { name }),
                     });
                 },

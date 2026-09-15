@@ -441,6 +441,7 @@ mod test {
     use crate::client::load_balancing::SubchannelState;
     use crate::client::load_balancing::child_manager::ChildManager;
     use crate::client::load_balancing::child_manager::ChildUpdate;
+    use crate::client::load_balancing::subchannel::SubchannelUpdate;
     use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
     use crate::client::load_balancing::test_utils::TestChannelController;
@@ -571,7 +572,7 @@ mod test {
         subchannels
     }
 
-    // Defines the functions resolver_update and subchannel_update to test
+    // Defines the functions resolver_update and work to test
     // aggregate_states.
     fn create_verifying_funcs_for_aggregate_tests() -> StubPolicyFuncs {
         StubPolicyFuncs {
@@ -589,16 +590,18 @@ mod test {
                     Ok(())
                 },
             )),
-            // Closure for subchannel_update. Sends a picker of the same state
-            // that was passed to it.
-            subchannel_update: Some(Arc::new(
-                move |data, updated_subchannel, state, controller| {
-                    controller.update_picker(LbState {
-                        connectivity_state: state.connectivity_state,
-                        picker: Arc::new(QueuingPicker {}),
-                    });
-                },
-            )),
+            // Closure for work. Sends a picker of the same state that was
+            // passed to it in the subchannel update.
+            work: Some(Arc::new(move |_data, data, controller| {
+                let update = data
+                    .expect("expected work data")
+                    .downcast::<SubchannelUpdate>()
+                    .expect("expected SubchannelUpdate");
+                controller.update_picker(LbState {
+                    connectivity_state: update.state.connectivity_state,
+                    picker: Arc::new(QueuingPicker {}),
+                });
+            })),
             ..Default::default()
         }
     }
