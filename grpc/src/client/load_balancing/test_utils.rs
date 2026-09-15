@@ -29,7 +29,6 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::sync::Notify;
 
 use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
@@ -57,14 +56,24 @@ pub(crate) fn new_request_headers() -> RequestHeaders {
 pub(crate) struct TestSubchannel {
     address: Address,
     tx_connect: std::sync::mpsc::Sender<TestEvent>,
+    work_scheduler: Arc<dyn WorkScheduler>,
 }
 
 impl TestSubchannel {
-    pub fn new(address: Address, tx_connect: std::sync::mpsc::Sender<TestEvent>) -> Self {
+    pub fn new(
+        address: Address,
+        tx_connect: std::sync::mpsc::Sender<TestEvent>,
+        work_scheduler: Arc<dyn WorkScheduler>,
+    ) -> Self {
         Self {
             address,
             tx_connect,
+            work_scheduler,
         }
+    }
+
+    pub fn work_scheduler(&self) -> &Arc<dyn WorkScheduler> {
+        &self.work_scheduler
     }
 }
 
@@ -127,11 +136,17 @@ pub(crate) struct TestChannelController {
 }
 
 impl ChannelController for TestChannelController {
-    fn new_subchannel(&mut self, address: &Address) -> (Arc<dyn Subchannel>, SubchannelState) {
+    fn new_subchannel(
+        &mut self,
+        address: &Address,
+        work_scheduler: Arc<dyn WorkScheduler>,
+    ) -> (Arc<dyn Subchannel>, SubchannelState) {
         println!("new_subchannel called for address {}", address);
-        let notify = Arc::new(Notify::new());
-        let subchannel: Arc<dyn Subchannel> =
-            Arc::new(TestSubchannel::new(address.clone(), self.tx_events.clone()));
+        let subchannel: Arc<dyn Subchannel> = Arc::new(TestSubchannel::new(
+            address.clone(),
+            self.tx_events.clone(),
+            work_scheduler,
+        ));
         self.tx_events
             .send(TestEvent::NewSubchannel(subchannel.clone()))
             .unwrap();
@@ -159,6 +174,13 @@ impl WorkScheduler for TestWorkScheduler {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct NopWorkScheduler;
+
+impl WorkScheduler for NopWorkScheduler {
+    fn schedule_work(&self, _data: Option<WorkData>) {}
+}
+
 // The callback to invoke when resolver_update is invoked on the stub policy.
 type ResolverUpdateFn = Arc<
     dyn Fn(
@@ -167,13 +189,6 @@ type ResolverUpdateFn = Arc<
             Option<&DynLbConfig>,
             &mut dyn ChannelController,
         ) -> Result<(), String>
-        + Send
-        + Sync,
->;
-
-// The callback to invoke when subchannel_update is invoked on the stub policy.
-type SubchannelUpdateFn = Arc<
-    dyn Fn(&mut StubPolicyData, Arc<dyn Subchannel>, &SubchannelState, &mut dyn ChannelController)
         + Send
         + Sync,
 >;
@@ -188,7 +203,6 @@ type WorkFn =
 #[derive(Clone, Default)]
 pub(crate) struct StubPolicyFuncs {
     pub resolver_update: Option<ResolverUpdateFn>,
-    pub subchannel_update: Option<SubchannelUpdateFn>,
     pub exit_idle: Option<ExitIdleFn>,
     pub work: Option<WorkFn>,
 }
@@ -236,17 +250,6 @@ impl LbPolicy for StubPolicy {
             return f(&mut self.data, update, config, channel_controller);
         }
         Ok(())
-    }
-
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        if let Some(f) = &self.funcs.subchannel_update {
-            f(&mut self.data, subchannel, state, channel_controller);
-        }
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {

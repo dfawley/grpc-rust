@@ -44,6 +44,7 @@ use crate::client::load_balancing::Pick;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
+use crate::client::load_balancing::SubchannelUpdate;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
@@ -166,7 +167,7 @@ impl PickFirstPolicy {
             } else {
                 // Get a new subchannel handle from the controller if we don't
                 // have an existing one.
-                channel_controller.new_subchannel(&addr)
+                channel_controller.new_subchannel(&addr, self.work_scheduler.clone())
             };
 
             // Track the best candidate for immediate activation:
@@ -480,57 +481,8 @@ impl PickFirstPolicy {
         channel_controller.request_resolution();
         Err(err.clone())
     }
-}
 
-impl LbPolicy for PickFirstPolicy {
-    type LbConfig = PickFirstConfig;
-
-    fn resolver_update(
-        &mut self,
-        update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
-        channel_controller: &mut dyn ChannelController,
-    ) -> Result<(), String> {
-        self.timer = None;
-
-        // Reset steady state on new update
-        self.steady_state = None;
-
-        match update.endpoints {
-            Ok(endpoints) => {
-                let new_addresses = self.compile_address(endpoints, config, channel_controller);
-                // If we have no addresses, clear subchannels and set TRANSIENT_FAILURE.
-                if new_addresses.is_empty() {
-                    self.subchannels.clear();
-                    self.selected = None;
-                    self.set_transient_failure(
-                        channel_controller,
-                        Some("empty address list".to_string()),
-                    )?;
-                }
-
-                if let Some(ready_subchannel) =
-                    self.rebuild_subchannels(new_addresses, channel_controller)
-                {
-                    self.subchannel_activate(ready_subchannel, channel_controller);
-                } else {
-                    self.start_connection_pass(channel_controller);
-                }
-            }
-            Err(e) => {
-                let error = e.to_string();
-                if self.subchannels.is_empty()
-                    || self.connectivity_state == ConnectivityState::TransientFailure
-                {
-                    self.set_transient_failure(channel_controller, Some(error))?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn subchannel_update(
+    pub(crate) fn subchannel_update(
         &mut self,
         subchannel: Arc<dyn Subchannel>,
         state: &SubchannelState,
@@ -585,9 +537,68 @@ impl LbPolicy for PickFirstPolicy {
             }
         }
     }
+}
+
+impl LbPolicy for PickFirstPolicy {
+    type LbConfig = PickFirstConfig;
+
+    fn resolver_update(
+        &mut self,
+        update: ResolverUpdate,
+        config: Option<&Self::LbConfig>,
+        channel_controller: &mut dyn ChannelController,
+    ) -> Result<(), String> {
+        self.timer = None;
+
+        // Reset steady state on new update
+        self.steady_state = None;
+
+        match update.endpoints {
+            Ok(endpoints) => {
+                let new_addresses = self.compile_address(endpoints, config, channel_controller);
+                // If we have no addresses, clear subchannels and set TRANSIENT_FAILURE.
+                if new_addresses.is_empty() {
+                    self.subchannels.clear();
+                    self.selected = None;
+                    self.set_transient_failure(
+                        channel_controller,
+                        Some("empty address list".to_string()),
+                    )?;
+                }
+
+                if let Some(ready_subchannel) =
+                    self.rebuild_subchannels(new_addresses, channel_controller)
+                {
+                    self.subchannel_activate(ready_subchannel, channel_controller);
+                } else {
+                    self.start_connection_pass(channel_controller);
+                }
+            }
+            Err(e) => {
+                let error = e.to_string();
+                if self.subchannels.is_empty()
+                    || self.connectivity_state == ConnectivityState::TransientFailure
+                {
+                    self.set_transient_failure(channel_controller, Some(error))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
 
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
-        debug_assert!(data.is_none(), "expected no data but got {data:?}");
+        if let Some(data) = data {
+            let sc_update = match data.downcast::<SubchannelUpdate>() {
+                Ok(u) => u,
+                Err(data) => {
+                    debug_assert!(false, "expected SubchannelUpdate but got {data:?}");
+                    return;
+                }
+            };
+            self.subchannel_update(sc_update.subchannel, &sc_update.state, channel_controller);
+            return;
+        }
         if self.connectivity_state == ConnectivityState::Idle {
             // TODO: is it safe to assume any call to work() while idle means we
             // should connect?

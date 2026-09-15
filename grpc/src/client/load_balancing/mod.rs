@@ -101,22 +101,21 @@ pub trait LbPolicy: Send + Sync + Debug + 'static {
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String>;
 
-    /// Called by the channel when any subchannel created by the LB policy
-    /// changes state.
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    );
-
     /// Called by the channel in response to a call from the LB policy to the
-    /// WorkScheduler's request_work method.
+    /// WorkScheduler's request_work method or when a subchannel created by
+    /// the LB policy changes state.
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController);
 
     /// Called by the channel when an LbPolicy goes idle and the channel
     /// wants it to start connecting to subchannels again.
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController);
+}
+
+/// An update to a subchannel's state scheduled via a [`WorkScheduler`].
+#[derive(Clone, Debug)]
+pub struct SubchannelUpdate {
+    pub subchannel: Arc<dyn Subchannel>,
+    pub state: SubchannelState,
 }
 
 /// A collection of data configured on the channel that is constructing this
@@ -221,7 +220,11 @@ impl ParsedJsonLbConfig {
 /// Controls channel behaviors.
 pub trait ChannelController: Send + Sync {
     /// Creates a new subchannel and returns its current state.
-    fn new_subchannel(&mut self, address: &Address) -> (Arc<dyn Subchannel>, SubchannelState);
+    fn new_subchannel(
+        &mut self,
+        address: &Address,
+        work_scheduler: Arc<dyn WorkScheduler>,
+    ) -> (Arc<dyn Subchannel>, SubchannelState);
 
     /// Provides a new snapshot of the LB policy's state to the channel.
     fn update_picker(&mut self, update: LbState);
@@ -442,15 +445,6 @@ impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         (**self).resolver_update(update, config, channel_controller)
-    }
-
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        (**self).subchannel_update(subchannel, state, channel_controller);
     }
 
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
