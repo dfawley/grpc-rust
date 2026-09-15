@@ -319,7 +319,7 @@ impl InternalSubchannel {
                 proxy_opts,
             ));
         }
-        let this = Arc::new_cyclic(|weak_self| Self {
+        Arc::new_cyclic(|weak_self| Self {
             address: address.clone(),
             on_drop: on_drop.clone(),
             data: Arc::new(Mutex::new(InternalSubchannelData {
@@ -334,9 +334,7 @@ impl InternalSubchannel {
                 transport_options: TransportOptions::default(), // TODO: should be configurable
                 security_opts,
             })),
-        });
-        move_to_idle(&this.data);
-        this
+        })
     }
 
     pub(super) fn address(&self) -> Address {

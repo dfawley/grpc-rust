@@ -429,10 +429,10 @@ impl ResolverChannelController {
             security_opts,
         };
         Self {
-            lb_policy: SubchannelSharing::new(GracefulSwitchPolicy::new(
-                runtime.clone(),
+            lb_policy: SubchannelSharing::new(
+                GracefulSwitchPolicy::new(runtime.clone(), lb_work_scheduler.clone()),
                 lb_work_scheduler.clone(),
-            )),
+            ),
             lb_work_scheduler,
             lb_channel_controller,
             wqtx: wqtx.clone(),
