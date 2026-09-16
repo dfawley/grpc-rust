@@ -155,7 +155,10 @@ pub(crate) struct TestWorkScheduler {
 
 impl WorkScheduler for TestWorkScheduler {
     fn schedule_work(&self, data: Option<WorkData>) {
-        self.tx_events.send(TestEvent::ScheduleWork(data)).unwrap();
+        // Subchannels schedule work when they are dropped, which can happen
+        // after the test has stopped listening.  Ignore the error rather than
+        // panicking inside a Drop impl.
+        let _ = self.tx_events.send(TestEvent::ScheduleWork(data));
     }
 }
 
