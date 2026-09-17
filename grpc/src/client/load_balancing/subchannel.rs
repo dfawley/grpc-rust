@@ -86,6 +86,29 @@ impl Display for SubchannelState {
     }
 }
 
+/// Describes a state change of a subchannel.
+///
+/// This is delivered to an LB policy's
+/// [`work`](crate::client::load_balancing::LbPolicy::work) method as
+/// [`WorkData`](crate::client::load_balancing::WorkData) by the
+/// [`WorkScheduler`](crate::client::load_balancing::WorkScheduler) the policy
+/// provided when it created the subchannel via
+/// [`new_subchannel`](crate::client::load_balancing::ChannelController::new_subchannel).
+#[derive(Debug)]
+pub struct SubchannelUpdate {
+    /// The subchannel whose state changed.
+    pub subchannel: Arc<dyn Subchannel>,
+    /// The new state of the subchannel.
+    pub state: SubchannelState,
+}
+
+impl SubchannelUpdate {
+    /// Creates a new SubchannelUpdate.
+    pub fn new(subchannel: Arc<dyn Subchannel>, state: SubchannelState) -> Self {
+        Self { subchannel, state }
+    }
+}
+
 pub trait DynHash {
     #[allow(clippy::redundant_allocation)]
     fn dyn_hash(&self, state: &mut Box<&mut dyn Hasher>);
@@ -238,7 +261,7 @@ pub trait ForwardingSubchannel: DynHash + DynPartialEq + Any + Send + Sync {
     }
 
     fn connect(&self) {
-        self.delegate().connect()
+        self.delegate().connect();
     }
 }
 
@@ -252,7 +275,7 @@ impl<T: ForwardingSubchannel> Subchannel for T {
     }
 
     fn connect(&self) {
-        self.connect()
+        self.connect();
     }
 }
 impl<T: ForwardingSubchannel> private::Sealed for T {}
