@@ -54,6 +54,7 @@ pub struct Lazy<T: LbPolicyBuilder> {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Inner<T: LbPolicyBuilder> {
     Void,
     Pending(Pending<T>),
