@@ -1107,7 +1107,10 @@ mod tests {
             StubPolicyFuncs {
                 work: Some(Arc::new(move |data, work_item, cc| {
                     if let Some(Ok(update)) = work_item.map(|d| d.downcast::<SubchannelUpdate>()) {
-                        updates_clone.lock().unwrap().push(update.state.connectivity_state);
+                        updates_clone
+                            .lock()
+                            .unwrap()
+                            .push(update.state.connectivity_state);
                         return;
                     }
                     let addr = Address {

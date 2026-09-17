@@ -461,7 +461,7 @@ impl name_resolution::ChannelController for ResolverChannelController {
 
 struct LbChannelController {
     lb_work_scheduler: Arc<LbWorkScheduler>,
-    transport_registry: TransportRegistry,   // For creating subchannels
+    transport_registry: TransportRegistry, // For creating subchannels
     lb_watcher: Arc<Watcher<LbState>>,
     runtime: GrpcRuntime, // For creating subchannels
     security_opts: SecurityOpts,

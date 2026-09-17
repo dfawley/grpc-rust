@@ -222,9 +222,9 @@ mod test {
     use crate::client::load_balancing::Subchannel;
     use crate::client::load_balancing::SubchannelState;
     use crate::client::load_balancing::WorkScheduler;
-    use crate::client::load_balancing::subchannel::SubchannelUpdate;
     use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
     use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
+    use crate::client::load_balancing::subchannel::SubchannelUpdate;
     use crate::client::load_balancing::test_utils::StubPolicyData;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
     use crate::client::load_balancing::test_utils::TestChannelController;
