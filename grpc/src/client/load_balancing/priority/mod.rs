@@ -352,26 +352,32 @@ enum ChildState {
 
 impl ChildState {
     /// Returns the state of a child that is reporting `connectivity_state`,
-    /// disregarding its previous state.  `connecting_timer` is called to start
-    /// a failover timer if the child is connecting.
+    /// disregarding its previous state.  Starts a failover timer if the child
+    /// is connecting.
     fn from_connectivity_state(
         connectivity_state: ConnectivityState,
-        connecting_timer: impl FnOnce() -> Timer,
+        work_scheduler: &Arc<dyn WorkScheduler>,
+        rt: &GrpcRuntime,
     ) -> Self {
         match connectivity_state {
             ConnectivityState::Idle | ConnectivityState::Ready => ChildState::ReadyOrIdle,
-            ConnectivityState::Connecting => ChildState::Connecting(connecting_timer()),
+            ConnectivityState::Connecting => ChildState::Connecting(Timer::new(
+                CONNECTING_TIMEOUT,
+                work_scheduler.clone(),
+                rt.clone(),
+            )),
             ConnectivityState::TransientFailure => ChildState::TransientFailure,
         }
     }
 
     /// Updates the state of a child in this state that is now reporting
-    /// `connectivity_state`.  `connecting_timer` is called to start a failover
-    /// timer if the child starts connecting.
+    /// `connectivity_state`.  Starts a failover timer if the child starts
+    /// connecting.
     fn update(
         &mut self,
         connectivity_state: ConnectivityState,
-        connecting_timer: impl FnOnce() -> Timer,
+        work_scheduler: &Arc<dyn WorkScheduler>,
+        rt: &GrpcRuntime,
     ) {
         match (&*self, connectivity_state) {
             // While deactivated, retain the 15-minute deactivation timer (see
@@ -391,7 +397,7 @@ impl ChildState {
                 ConnectivityState::Connecting,
             ) => *self = ChildState::ConnectingExpired,
             (_, connectivity_state) => {
-                *self = Self::from_connectivity_state(connectivity_state, connecting_timer);
+                *self = Self::from_connectivity_state(connectivity_state, work_scheduler, rt);
             }
         }
     }
@@ -584,11 +590,10 @@ fn update_child_policy(
 impl CreatedChild {
     /// Updates `state` to reflect the connectivity state most recently
     /// reported by the child policy and the state of its failover timer.
-    /// `connecting_timer` is called to start a failover timer if the child
-    /// starts connecting.
-    fn update_state(&mut self, connecting_timer: impl FnOnce() -> Timer) {
+    /// Starts a failover timer if the child starts connecting.
+    fn update_state(&mut self, work_scheduler: &Arc<dyn WorkScheduler>, rt: &GrpcRuntime) {
         self.state
-            .update(self.policy.state().connectivity_state, connecting_timer);
+            .update(self.policy.state().connectivity_state, work_scheduler, rt);
     }
 }
 
@@ -639,13 +644,7 @@ impl PriorityPolicy {
     /// Children that have not been created yet are left untouched.
     fn update_child_data(&mut self) {
         for child in self.children.iter_mut().filter_map(|c| c.child.as_mut()) {
-            child.update_state(|| {
-                Timer::new(
-                    CONNECTING_TIMEOUT,
-                    self.work_scheduler.clone(),
-                    self.rt.clone(),
-                )
-            });
+            child.update_state(&self.work_scheduler, &self.rt);
         }
     }
 
@@ -677,13 +676,6 @@ impl PriorityPolicy {
         // still pending.
         for idx in 0..self.children.len() {
             let child_data = &mut self.children[idx];
-            let connecting_timer = || {
-                Timer::new(
-                    CONNECTING_TIMEOUT,
-                    self.work_scheduler.clone(),
-                    self.rt.clone(),
-                )
-            };
 
             let child = match &mut child_data.child {
                 Some(child) => {
@@ -691,7 +683,8 @@ impl PriorityPolicy {
                     if let ChildState::Deactivated(_) = child.state {
                         child.state = ChildState::from_connectivity_state(
                             child.policy.state().connectivity_state,
-                            connecting_timer,
+                            &self.work_scheduler,
+                            &self.rt,
                         );
                     }
                     child
@@ -720,7 +713,8 @@ impl PriorityPolicy {
                     }
                     let state = ChildState::from_connectivity_state(
                         policy.state().connectivity_state,
-                        connecting_timer,
+                        &self.work_scheduler,
+                        &self.rt,
                     );
                     child_data.child.insert(CreatedChild { policy, state })
                 }
