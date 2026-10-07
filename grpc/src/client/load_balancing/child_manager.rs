@@ -34,6 +34,7 @@
 //! them.  Use this when the children are a pure function of the most recent
 //! update (e.g. round robin, which creates one child per endpoint).
 
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Debug;
@@ -157,14 +158,18 @@ impl<P: LbPolicy> Child<P> {
         policy.resolver_update(update, config, &mut channel_controller)
     }
 
-    /// Calls [`LbPolicy::work`] on the child, recording any picker it
-    /// produces, if `data` was a work item scheduled by this child's
-    /// [`WorkScheduler`].  Otherwise, returns `data` back to the caller.
+    /// Calls [`LbPolicy::work`] on the child, recording any picker it produces,
+    /// if `data` was a work item scheduled by this child's [`WorkScheduler`].
+    /// Otherwise, returns `data` back to the caller.  The caller should ensure
+    /// the only possible [`WorkData`] passed is intended for a [`Child`] --
+    /// that is, it should handle any work items it produced before attempting
+    /// to pass it to a child.
     pub fn try_work(
         &mut self,
         data: WorkData,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), WorkData> {
+        debug_assert_eq!(data.type_id(), TypeId::of::<ChildWorkItem>());
         let item = data.downcast::<ChildWorkItem>()?;
         if item.handle != self.handle {
             // This work item belongs to another child.
