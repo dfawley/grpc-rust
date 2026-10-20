@@ -24,12 +24,20 @@
 
 use std::error::Error;
 use std::future::Future;
+use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::pin::pin;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
 use std::task::Context;
 use std::task::Poll;
+use std::task::ready;
+use std::time::Instant;
 
 use bytes::Buf;
 use bytes::BufMut as _;
@@ -92,6 +100,7 @@ use crate::core::StreamEnded;
 use crate::private;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
+use crate::rt::Sleep;
 use crate::rt::TcpOptions;
 use crate::rt::UnixSocketOptions;
 use crate::rt::hyper_wrapper::HyperCompatExec;
@@ -168,13 +177,64 @@ impl Invoke for TonicTransport {
                 .local_err_streams(StatusError::new(StatusCodeError::Internal, "invalid path"));
         };
 
-        let mut grpc = self.grpc.clone();
-        if let Err(e) = grpc.ready().await {
-            return self.local_err_streams(StatusError::new(
-                StatusCodeError::Unavailable,
-                format!("Service was not ready: {e}"),
-            ));
+        // If a deadline is set, start a timer that will fire when it is
+        // reached.  The timer bounds both the wait for the transport to become
+        // ready and the lifetime of the stream itself.
+        let deadline = options.deadline();
+        let mut deadline_timer = None;
+        if let Some(deadline) = deadline {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
+                return self.local_err_streams(deadline_exceeded_error());
+            }
+            deadline_timer = Some(self.runtime.sleep(timeout));
         }
+
+        let mut grpc = self.grpc.clone();
+        let ready = match deadline_timer.as_mut() {
+            Some(timer) => race_deadline(timer, grpc.ready()).await,
+            None => Some(grpc.ready().await),
+        };
+        match ready {
+            None => return self.local_err_streams(deadline_exceeded_error()),
+            Some(Err(e)) => {
+                return self.local_err_streams(StatusError::new(
+                    StatusCodeError::Unavailable,
+                    format!("Service was not ready: {e}"),
+                ));
+            }
+            Some(Ok(())) => {}
+        }
+
+        // Propagate the remaining time to the server via the `grpc-timeout`
+        // header.  This is computed after waiting for readiness so that it
+        // reflects the time actually remaining when the request is sent.
+        if let Some(deadline) = deadline {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
+                return self.local_err_streams(deadline_exceeded_error());
+            }
+            request.set_timeout(timeout);
+        }
+
+        // If there is a deadline, the spawned task below also enforces it.
+        // The task notifies the TonicRecvStream through `deadline_rx` when the
+        // deadline fires.
+        let mut deadline_rx = None;
+        let enforcer = deadline_timer.map(|timer| {
+            let (fired_tx, fired_rx) = oneshot::channel();
+            deadline_rx = Some(fired_rx);
+            let body_slot = ResponseBodySlot::default();
+            // TonicService::call picks this up and routes the response body
+            // through it, so the enforcer can tear the body down.
+            request.extensions_mut().insert(body_slot.clone());
+            DeadlineEnforcer {
+                timer,
+                fired_tx,
+                cancel: cancel_tx.clone(),
+                body_slot,
+            }
+        });
 
         // Note that Tonic's streaming call blocks until the server's headers
         // are received.  The client needs a SendStream to provide the request
@@ -182,10 +242,22 @@ impl Invoke for TonicTransport {
         // headers.  So, we spawn a task for this period of time, and then we
         // send the response (headers, stream) to the TonicRecvStream when it is
         // available.
+        //
+        // If the call has a deadline, the same task then stays alive until the
+        // deadline is reached or the call ends, whichever happens first.  That
+        // way the stream is cancelled as soon as the deadline passes, even if
+        // the application is not inside `recv` at the time.
         let (resp_tx, resp_rx) = oneshot::channel();
         self.runtime.spawn(Box::pin(async move {
-            let response = grpc.streaming(request, path, BufCodec {}).await;
-            let _ = resp_tx.send(response);
+            // Start the RPC future and poll it directly or inside the enforcer
+            // as needed.
+            let response = grpc.streaming(request, path, BufCodec {});
+            match enforcer {
+                None => {
+                    let _ = resp_tx.send(response.await);
+                }
+                Some(enforcer) => enforcer.run(response, resp_tx).await,
+            }
         }));
 
         (
@@ -194,8 +266,161 @@ impl Invoke for TonicTransport {
                 state: StreamState::AwaitingHeaders(resp_rx),
                 cancel_tx: Some(cancel_tx),
                 connection_info: Some(self.connection_info.clone()),
+                deadline_rx,
             },
         )
+    }
+}
+
+type ResponseResult = Result<tonic::Response<Streaming<Bytes>>, TonicStatus>;
+
+/// Enforces a call's deadline from the call's background task.
+///
+/// When the deadline fires, the enforcer notifies the [`TonicRecvStream`] and
+/// then resets the HTTP/2 stream.  It always resets it, whatever the call
+/// state:
+///
+/// * Before response headers, it drops the in-flight response future.  Hyper
+///   resets the stream when that happens.
+/// * While the request body is still open, it cancels the request through
+///   tonic's cancellation token, which also resets the stream.
+/// * After response headers, it drops the response body via the
+///   [`ResponseBodySlot`].  Once the request body has finished, that releases
+///   the last handle to the h2 stream, and h2 resets the stream.
+struct DeadlineEnforcer {
+    timer: Pin<Box<dyn Sleep>>,
+    /// Signals the `TonicRecvStream` that the deadline fired.  The
+    /// `TonicRecvStream` drops the receiver when the call ends, which tells
+    /// the enforcer to stop.
+    fired_tx: oneshot::Sender<()>,
+    cancel: CancellationHandle,
+    body_slot: ResponseBodySlot,
+}
+
+impl DeadlineEnforcer {
+    async fn run(
+        mut self,
+        response: impl Future<Output = ResponseResult>,
+        resp_tx: oneshot::Sender<ResponseResult>,
+    ) {
+        // Drive `response` until it completes or the `TonicRecvStream` is
+        // dropped.  `race_deadline` consumes this future, so if the deadline
+        // fires first, `response` is dropped before `expire` runs.
+        let response_or_closed = async {
+            let mut response = pin!(response);
+            let mut closed = pin!(self.fired_tx.closed());
+            poll_fn(|cx| {
+                if let Poll::Ready(res) = response.as_mut().poll(cx) {
+                    return Poll::Ready(Some(res));
+                }
+                closed.as_mut().poll(cx).map(|()| None)
+            })
+            .await
+        };
+        match race_deadline(&mut self.timer, response_or_closed).await {
+            None => return self.expire(),
+            Some(None) => return,
+            Some(Some(response)) => {
+                let is_ok = response.is_ok();
+                if resp_tx.send(response).is_err() || !is_ok {
+                    // The TonicRecvStream is gone or the call has already
+                    // ended (Trailers-Only response).
+                    return;
+                }
+            }
+        }
+        // Wait for the deadline, or for the TonicRecvStream to finish the call
+        // (it drops the receiver).
+        if race_deadline(&mut self.timer, self.fired_tx.closed())
+            .await
+            .is_none()
+        {
+            self.expire();
+        }
+    }
+
+    fn expire(self) {
+        // Notify the TonicRecvStream before tearing anything down.  That way,
+        // if it sees an error caused by the teardown, it can tell the error
+        // came from the deadline.
+        let _ = self.fired_tx.send(());
+        self.cancel.cancel();
+        self.body_slot.kill();
+    }
+}
+
+/// A call's response body, held in shared ownership so that
+/// [`DeadlineEnforcer`] can drop it (and so reset the stream) without waiting
+/// for the application to call `recv`.
+#[derive(Clone, Default)]
+struct ResponseBodySlot(Arc<Mutex<BodySlotState>>);
+
+#[derive(Default)]
+enum BodySlotState {
+    /// The response has not arrived yet.
+    #[default]
+    Empty,
+    Attached(Body),
+    /// The deadline fired; any body has been dropped.
+    Killed,
+}
+
+impl ResponseBodySlot {
+    fn lock(&self) -> MutexGuard<'_, BodySlotState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stores `body` in the slot and returns a body that reads from it.
+    fn attach(&self, body: Body) -> Body {
+        {
+            let mut state = self.lock();
+            if !matches!(*state, BodySlotState::Killed) {
+                *state = BodySlotState::Attached(body);
+            }
+        }
+        Body::new(SlotBody(self.clone()))
+    }
+
+    /// Drops the body, if any, and fails any future reads.
+    fn kill(&self) {
+        let old = std::mem::replace(&mut *self.lock(), BodySlotState::Killed);
+        // Drop the body (which may send RST_STREAM) outside the lock.
+        drop(old);
+    }
+}
+
+/// The response body handed to tonic.  It reads from a [`ResponseBodySlot`].
+struct SlotBody(ResponseBodySlot);
+
+impl http_body::Body for SlotBody {
+    type Data = Bytes;
+    type Error = TonicStatus;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        match &mut *self.0.lock() {
+            BodySlotState::Attached(body) => Pin::new(body).poll_frame(cx),
+            BodySlotState::Empty | BodySlotState::Killed => Poll::Ready(Some(Err(
+                TonicStatus::deadline_exceeded(deadline_exceeded_error().message()),
+            ))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match &*self.0.lock() {
+            BodySlotState::Attached(body) => body.is_end_stream(),
+            // Not at end-of-stream: the next poll_frame reports the error.
+            BodySlotState::Empty | BodySlotState::Killed => false,
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match &*self.0.lock() {
+            BodySlotState::Attached(body) => body.size_hint(),
+            BodySlotState::Empty | BodySlotState::Killed => http_body::SizeHint::default(),
+        }
     }
 }
 
@@ -208,9 +433,31 @@ impl TonicTransport {
                 state: StreamState::LocalError(status),
                 cancel_tx: None,
                 connection_info: Some(self.connection_info.clone()),
+                deadline_rx: None,
             },
         )
     }
+}
+
+/// Returns the status used when an RPC's deadline is exceeded.
+fn deadline_exceeded_error() -> StatusError {
+    StatusError::new(StatusCodeError::DeadlineExceeded, "Deadline exceeded")
+}
+
+/// Drives `fut` to completion unless `timer` fires first.
+///
+/// Returns `None` if the timer fired before `fut` completed.  `fut` is always
+/// polled before `timer`, so a result that is already available wins over an
+/// expired timer.
+async fn race_deadline<F: Future>(timer: &mut Pin<Box<dyn Sleep>>, fut: F) -> Option<F::Output> {
+    let mut fut = pin!(fut);
+    poll_fn(|cx| {
+        if let Poll::Ready(output) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(output));
+        }
+        timer.as_mut().poll(cx).map(|()| None)
+    })
+    .await
 }
 
 struct TonicSendStream {
@@ -240,6 +487,10 @@ struct TonicRecvStream {
     state: StreamState,
     cancel_tx: Option<CancellationHandle>,
     connection_info: Option<ConnectionInfo>,
+    /// Resolves when the call's [`DeadlineEnforcer`] fires.  Present only
+    /// while the call is live and has a deadline.  Dropping it tells the
+    /// enforcer to stop.
+    deadline_rx: Option<oneshot::Receiver<()>>,
 }
 
 impl TonicRecvStream {
@@ -298,6 +549,66 @@ enum StreamState {
 
 impl RecvStream for TonicRecvStream {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
+        let Some(mut deadline_rx) = self.deadline_rx.take() else {
+            return self.recv_inner(msg).await;
+        };
+        let item = {
+            let mut recv = pin!(self.recv_inner(msg));
+            let mut deadline_live = true;
+            poll_fn(|cx| {
+                if deadline_live {
+                    match Pin::new(&mut deadline_rx).poll(cx) {
+                        Poll::Ready(Ok(())) => return Poll::Ready(None),
+                        // The enforcer is gone without firing (e.g. the call
+                        // ended), so the deadline can no longer fire.
+                        Poll::Ready(Err(_)) => deadline_live = false,
+                        Poll::Pending => {}
+                    }
+                }
+                if let Poll::Ready(item) = recv.as_mut().poll(cx) {
+                    return Poll::Ready(Some(item));
+                }
+                Poll::Pending
+            })
+            .await
+        };
+
+        match item {
+            // The enforcer signals before it tears the stream down, so if
+            // `recv` failed because the enforcer fired between polling
+            // `deadline_rx` and `recv`, the signal is already visible here.
+            // Report the deadline in that case while preserving any
+            // `connection_info` already taken by `recv_inner`.
+            Some(ResponseStreamItem::Trailers(trailers))
+                if trailers.status().is_err() && deadline_rx.try_recv().is_ok() =>
+            {
+                ResponseStreamItem::Trailers(
+                    Trailers::new(Err(deadline_exceeded_error()))
+                        .with_connection_info(trailers.connection_info().clone()),
+                )
+            }
+            Some(item) => {
+                // Keep watching the deadline only while the stream is live.
+                if !matches!(
+                    item,
+                    ResponseStreamItem::Trailers(_) | ResponseStreamItem::StreamClosed
+                ) {
+                    self.deadline_rx = Some(deadline_rx);
+                }
+                item
+            }
+            None => {
+                // The enforcer has already reset the stream; drop whatever
+                // state remains.
+                self.state = StreamState::Closed;
+                self.trailers_from_grpc_result(Err(deadline_exceeded_error()), None)
+            }
+        }
+    }
+}
+
+impl TonicRecvStream {
+    async fn recv_inner(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         // Take the current state, leaving `Closed` in its place temporarily
         let state = std::mem::replace(&mut self.state, StreamState::Closed);
 
@@ -565,9 +876,11 @@ impl GrpcService<Body> for TonicService {
         tower::Service::poll_ready(&mut self.inner, cx)
     }
 
-    fn call(&mut self, request: http::Request<Body>) -> Self::Future {
+    fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
+        let body_slot = request.extensions_mut().remove::<ResponseBodySlot>();
         ResponseFuture {
             inner: tower::Service::call(&mut self.inner, request),
+            body_slot,
         }
     }
 }
@@ -577,13 +890,20 @@ impl GrpcService<Body> for TonicService {
 /// This is returned by the `Service::call` on [`Channel`].
 pub(crate) struct ResponseFuture {
     inner: BufferResponseFuture<BoxFuture<'static, Result<HttpResponse<Body>, BoxError>>>,
+    /// If set, the response body is routed through this slot so the call's
+    /// [`DeadlineEnforcer`] can drop it.
+    body_slot: Option<ResponseBodySlot>,
 }
 
 impl Future for ResponseFuture {
     type Output = Result<http::Response<Body>, BoxError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner).poll(cx)
+        let response = ready!(Pin::new(&mut self.inner).poll(cx))?;
+        Poll::Ready(Ok(match self.body_slot.take() {
+            Some(slot) => response.map(|body| slot.attach(body)),
+            None => response,
+        }))
     }
 }
 

@@ -30,6 +30,7 @@ use std::result::Result;
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::async_trait;
 use bytes::Buf;
@@ -1256,3 +1257,680 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
     let req = WrappedEchoRequest(EchoRequest::default());
     assert!(tx.send(&req, SendOptions::default()).await.is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Deadline tests
+//
+// These run with tokio's clock paused.  While paused, tokio auto-advances the
+// clock to the next timer whenever the runtime is idle, so a deadline of an
+// hour expires as soon as nothing else can make progress.  Loopback socket I/O
+// is ready right away, so requests reach the server before the clock jumps.
+// ---------------------------------------------------------------------------
+
+/// A deadline long enough that only the paused clock can reach it.
+const LONG_DEADLINE: Duration = Duration::from_secs(60 * 60);
+
+/// How long to wait for the client to reset a stream.  This must be longer than
+/// [`LONG_DEADLINE`], since the paused clock advances straight to whichever
+/// timer is next.
+const RESET_WAIT_LIMIT: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// A request stream accepted by [`start_raw_h2_server`].
+type RawH2Stream = (
+    http::Request<h2::RecvStream>,
+    h2::server::SendResponse<Bytes>,
+);
+
+/// Starts a bare HTTP/2 server so tests can control server behavior at the
+/// frame level.  Each request stream it accepts is passed to the test.
+async fn start_raw_h2_server() -> (
+    SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<RawH2Stream>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+        // Keep driving the connection so that frames sent by the client (e.g.
+        // RST_STREAM) are processed even while the test is busy elsewhere.
+        while let Some(Ok(stream)) = connection.accept().await {
+            if tx.send(stream).is_err() {
+                break;
+            }
+        }
+    });
+    (addr, rx)
+}
+
+/// Sends gRPC response headers without ending the stream.  The returned
+/// `SendStream` must be kept alive to keep the stream open.
+fn send_grpc_response_headers(
+    respond: &mut h2::server::SendResponse<Bytes>,
+) -> h2::SendStream<Bytes> {
+    let response = http::Response::builder()
+        .status(200)
+        .header("content-type", "application/grpc")
+        .body(())
+        .unwrap();
+    respond.send_response(response, false).unwrap()
+}
+
+/// Reads the request body until the client half-closes the stream.
+async fn read_request_to_end(body: &mut h2::RecvStream) {
+    while let Some(data) = body.data().await {
+        let data = data.expect("request stream failed before half-close");
+        body.flow_control().release_capacity(data.len()).unwrap();
+    }
+}
+
+/// Waits for the client to reset a stream that has no response yet, and
+/// returns the reason code.
+async fn wait_for_reset(respond: &mut h2::server::SendResponse<Bytes>) -> Reason {
+    timeout(
+        RESET_WAIT_LIMIT,
+        std::future::poll_fn(|cx| respond.poll_reset(cx)),
+    )
+    .await
+    .expect("timed out waiting for RST_STREAM")
+    .expect("connection error while waiting for RST_STREAM")
+}
+
+/// Waits for the client to reset a stream after response headers were sent,
+/// and returns the reason code.
+async fn wait_for_reset_after_headers(send_stream: &mut h2::SendStream<Bytes>) -> Reason {
+    timeout(
+        RESET_WAIT_LIMIT,
+        std::future::poll_fn(|cx| send_stream.poll_reset(cx)),
+    )
+    .await
+    .expect("timed out waiting for RST_STREAM")
+    .expect("connection error while waiting for RST_STREAM")
+}
+
+/// Connects the tonic transport directly to `addr`, bypassing the channel.
+async fn connect_tonic_transport(addr: SocketAddr) -> Box<dyn crate::client::DynInvoke> {
+    super::reg();
+    let builder = GLOBAL_TRANSPORT_REGISTRY
+        .get_transport(TCP_IP_NETWORK_TYPE)
+        .unwrap();
+    let config = Arc::new(TransportOptions::default());
+    let security_opts = SecurityOpts {
+        credentials: LocalChannelCredentials::new_arc(),
+        authority: Authority::new("localhost".to_string(), None),
+        handshake_info: ClientHandshakeInfo::default(),
+    };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
+    let (conn, _sec_info, _disconnection_listener) = builder
+        .dyn_connect(
+            &address,
+            GrpcRuntime::new(TokioRuntime::default()),
+            &security_opts,
+            &config,
+        )
+        .await
+        .unwrap();
+    conn
+}
+
+fn call_options_with_timeout(timeout: Duration) -> CallOptions {
+    let mut options = CallOptions::new();
+    options.set_deadline(Instant::now() + timeout);
+    options
+}
+
+/// Parses a `grpc-timeout` header value (e.g. `"3599999m"`).
+fn parse_grpc_timeout(value: &str) -> Duration {
+    let (amount, unit) = value.split_at(value.len() - 1);
+    let amount: u64 = amount.parse().unwrap();
+    match unit {
+        "H" => Duration::from_secs(amount * 60 * 60),
+        "M" => Duration::from_secs(amount * 60),
+        "S" => Duration::from_secs(amount),
+        "m" => Duration::from_millis(amount),
+        "u" => Duration::from_micros(amount),
+        "n" => Duration::from_nanos(amount),
+        _ => panic!("invalid grpc-timeout unit in {value:?}"),
+    }
+}
+
+/// Asserts that `rx` reports DEADLINE_EXCEEDED and is then closed.
+async fn assert_recv_deadline_exceeded(rx: &mut Box<dyn crate::client::DynRecvStream>) {
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let item = rx.recv(&mut resp).await;
+    let ResponseStreamItem::Trailers(trailers) = item else {
+        panic!("Expected Trailers, got {item:?}");
+    };
+    let status = trailers.status().as_ref().unwrap_err();
+    assert_eq!(status.code(), StatusCodeError::DeadlineExceeded);
+    let item = rx.recv(&mut resp).await;
+    assert!(
+        matches!(item, ResponseStreamItem::StreamClosed),
+        "Expected StreamClosed, got {item:?}"
+    );
+}
+
+/// Sends messages until the send stream reports that it has ended.
+async fn assert_send_stream_ends(tx: &mut Box<dyn crate::client::DynSendStream>) {
+    let req = WrappedEchoRequest(EchoRequest::default());
+    timeout(DEFAULT_TEST_DURATION, async {
+        while tx.send(&req, SendOptions::default()).await.is_ok() {}
+    })
+    .await
+    .expect("send stream did not end");
+}
+
+const UNARY_METHOD: &str = "/grpc.examples.echo.Echo/UnaryEcho";
+const BIDI_METHOD: &str = "/grpc.examples.echo.Echo/BidirectionalStreamingEcho";
+
+// Tests that the deadline is sent to the server in the `grpc-timeout` header.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_deadline_sets_grpc_timeout_header() {
+    let (addr, mut streams) = start_raw_h2_server().await;
+    let conn = connect_tonic_transport(addr).await;
+
+    let (_tx, _rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(UNARY_METHOD),
+            call_options_with_timeout(LONG_DEADLINE),
+        )
+        .await;
+
+    let (request, _respond) = streams.recv().await.unwrap();
+    let header = request
+        .headers()
+        .get("grpc-timeout")
+        .expect("grpc-timeout header must be sent when a deadline is set")
+        .to_str()
+        .unwrap();
+    let sent = parse_grpc_timeout(header);
+    // The header is computed from real time, so allow some slack.
+    assert!(
+        sent <= LONG_DEADLINE && sent > LONG_DEADLINE - Duration::from_secs(60),
+        "grpc-timeout {header:?} does not match deadline {LONG_DEADLINE:?}"
+    );
+}
+
+// Tests that no `grpc-timeout` header is sent when there is no deadline.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_no_deadline_omits_grpc_timeout_header() {
+    let (addr, mut streams) = start_raw_h2_server().await;
+    let conn = connect_tonic_transport(addr).await;
+
+    let (_tx, _rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(UNARY_METHOD),
+            CallOptions::default(),
+        )
+        .await;
+
+    let (request, _respond) = streams.recv().await.unwrap();
+    assert!(request.headers().get("grpc-timeout").is_none());
+}
+
+// Regression test: the client half-closes and then waits for response
+// headers.  When the deadline fires, the stream must be reset right away, even
+// though the application is not calling `recv`.  Previously the in-flight
+// response future stayed alive until the server responded.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_deadline_resets_half_closed_stream_awaiting_headers() {
+    let (addr, mut streams) = start_raw_h2_server().await;
+    let conn = connect_tonic_transport(addr).await;
+
+    let start = time::Instant::now();
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(UNARY_METHOD),
+            call_options_with_timeout(LONG_DEADLINE),
+        )
+        .await;
+    let req = WrappedEchoRequest(EchoRequest {
+        message: "hello".into(),
+    });
+    tx.send(
+        &req,
+        SendOptions {
+            final_msg: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // The server receives the whole request, never responds, and waits for
+    // the client to reset the stream.  The client is not inside `recv`.
+    let (request, mut respond) = streams.recv().await.unwrap();
+    let mut body = request.into_body();
+    read_request_to_end(&mut body).await;
+    assert_eq!(wait_for_reset(&mut respond).await, Reason::CANCEL);
+    assert!(
+        start.elapsed() >= LONG_DEADLINE,
+        "stream was reset before the deadline"
+    );
+
+    assert_recv_deadline_exceeded(&mut rx).await;
+}
+
+// Tests that the stream is reset when the deadline fires while waiting for
+// response headers and the request stream is still open.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_deadline_resets_open_stream_awaiting_headers() {
+    let (addr, mut streams) = start_raw_h2_server().await;
+    let conn = connect_tonic_transport(addr).await;
+
+    let start = time::Instant::now();
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(BIDI_METHOD),
+            call_options_with_timeout(LONG_DEADLINE),
+        )
+        .await;
+
+    let (_request, mut respond) = streams.recv().await.unwrap();
+    assert_eq!(wait_for_reset(&mut respond).await, Reason::CANCEL);
+    assert!(
+        start.elapsed() >= LONG_DEADLINE,
+        "stream was reset before the deadline"
+    );
+
+    assert_send_stream_ends(&mut tx).await;
+    assert_recv_deadline_exceeded(&mut rx).await;
+}
+
+// Tests that a `recv` blocked waiting for response headers is ended by the
+// deadline when the server never responds, and that the stream is reset.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_deadline_interrupts_recv_awaiting_headers() {
+    let (addr, mut streams) = start_raw_h2_server().await;
+    let conn = connect_tonic_transport(addr).await;
+
+    let start = time::Instant::now();
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(UNARY_METHOD),
+            call_options_with_timeout(LONG_DEADLINE),
+        )
+        .await;
+    let req = WrappedEchoRequest(EchoRequest {
+        message: "hello".into(),
+    });
+    tx.send(
+        &req,
+        SendOptions {
+            final_msg: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // The server accepts the stream but never sends headers.  It waits for
+    // the client to reset the stream.
+    let server = tokio::spawn(async move {
+        let (request, mut respond) = streams.recv().await.unwrap();
+        let mut body = request.into_body();
+        read_request_to_end(&mut body).await;
+        wait_for_reset(&mut respond).await
+    });
+
+    // Block in recv while still waiting for headers.  The outer timeout is
+    // longer than the deadline, so if the deadline is not enforced this fails
+    // instead of hanging.
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let item = timeout(RESET_WAIT_LIMIT, rx.recv(&mut resp))
+        .await
+        .expect("recv was not ended by the deadline");
+    assert!(
+        start.elapsed() >= LONG_DEADLINE,
+        "recv ended before the deadline"
+    );
+    let ResponseStreamItem::Trailers(trailers) = item else {
+        panic!("Expected Trailers, got {item:?}");
+    };
+    let status = trailers.status().as_ref().unwrap_err();
+    assert_eq!(status.code(), StatusCodeError::DeadlineExceeded);
+    let item = rx.recv(&mut resp).await;
+    assert!(
+        matches!(item, ResponseStreamItem::StreamClosed),
+        "Expected StreamClosed, got {item:?}"
+    );
+
+    assert_eq!(server.await.unwrap(), Reason::CANCEL);
+}
+
+// Tests that the stream is reset when the deadline fires after the response
+// headers arrived and the client has half-closed.  The application is not
+// calling `recv`.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_deadline_resets_half_closed_stream_after_headers() {
+    let (addr, mut streams) = start_raw_h2_server().await;
+    let conn = connect_tonic_transport(addr).await;
+
+    let start = time::Instant::now();
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(UNARY_METHOD),
+            call_options_with_timeout(LONG_DEADLINE),
+        )
+        .await;
+
+    let (request, mut respond) = streams.recv().await.unwrap();
+    let mut send_stream = send_grpc_response_headers(&mut respond);
+
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let item = rx.recv(&mut resp).await;
+    assert!(
+        matches!(item, ResponseStreamItem::Headers(_)),
+        "Expected Headers, got {item:?}"
+    );
+
+    let req = WrappedEchoRequest(EchoRequest::default());
+    tx.send(
+        &req,
+        SendOptions {
+            final_msg: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut body = request.into_body();
+    read_request_to_end(&mut body).await;
+
+    assert_eq!(
+        wait_for_reset_after_headers(&mut send_stream).await,
+        Reason::CANCEL
+    );
+    assert!(
+        start.elapsed() >= LONG_DEADLINE,
+        "stream was reset before the deadline"
+    );
+
+    assert_recv_deadline_exceeded(&mut rx).await;
+}
+
+// Tests that the stream is reset when the deadline fires after the response
+// headers arrived and the request stream is still open.  The application is
+// not calling `recv`.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_deadline_resets_open_stream_after_headers() {
+    let (addr, mut streams) = start_raw_h2_server().await;
+    let conn = connect_tonic_transport(addr).await;
+
+    let start = time::Instant::now();
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(BIDI_METHOD),
+            call_options_with_timeout(LONG_DEADLINE),
+        )
+        .await;
+
+    let (_request, mut respond) = streams.recv().await.unwrap();
+    let mut send_stream = send_grpc_response_headers(&mut respond);
+
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let item = rx.recv(&mut resp).await;
+    assert!(
+        matches!(item, ResponseStreamItem::Headers(_)),
+        "Expected Headers, got {item:?}"
+    );
+
+    assert_eq!(
+        wait_for_reset_after_headers(&mut send_stream).await,
+        Reason::CANCEL
+    );
+    assert!(
+        start.elapsed() >= LONG_DEADLINE,
+        "stream was reset before the deadline"
+    );
+
+    assert_send_stream_ends(&mut tx).await;
+    assert_recv_deadline_exceeded(&mut rx).await;
+}
+
+// Tests that a `recv` blocked waiting for a message is ended by the deadline.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_deadline_interrupts_recv() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_copy = shutdown_notify.clone();
+    let server_handle = tokio::spawn(async move {
+        let svc = EchoServer::new(EchoService {
+            response_headers: None,
+            response_error: None,
+        });
+        let _ = Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown_notify_copy.notified(),
+            )
+            .await;
+    });
+
+    let conn = connect_tonic_transport(addr).await;
+    let start = time::Instant::now();
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(BIDI_METHOD),
+            call_options_with_timeout(LONG_DEADLINE),
+        )
+        .await;
+
+    // A message sent before the deadline is echoed back normally.
+    let req = WrappedEchoRequest(EchoRequest {
+        message: "hello".into(),
+    });
+    tx.send(&req, SendOptions::default()).await.unwrap();
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let item = rx.recv(&mut resp).await;
+    assert!(
+        matches!(item, ResponseStreamItem::Headers(_)),
+        "Expected Headers, got {item:?}"
+    );
+    let item = rx.recv(&mut resp).await;
+    assert!(
+        matches!(item, ResponseStreamItem::Message),
+        "Expected Message, got {item:?}"
+    );
+    assert_eq!(resp.0.message, "hello");
+
+    // The echo server sends nothing more until it receives another request,
+    // so this recv blocks until the deadline.
+    assert_recv_deadline_exceeded(&mut rx).await;
+    assert!(
+        start.elapsed() >= LONG_DEADLINE,
+        "RPC failed before its deadline"
+    );
+    assert_send_stream_ends(&mut tx).await;
+
+    shutdown_notify.notify_one();
+    server_handle.await.unwrap();
+}
+
+// Tests that an RPC that finishes before its deadline is unaffected, and that
+// the deadline expiring later does not disturb the finished stream.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_deadline_not_exceeded() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_copy = shutdown_notify.clone();
+    let server_handle = tokio::spawn(async move {
+        let svc = EchoServer::new(EchoService {
+            response_headers: None,
+            response_error: None,
+        });
+        let _ = Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown_notify_copy.notified(),
+            )
+            .await;
+    });
+
+    let conn = connect_tonic_transport(addr).await;
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(UNARY_METHOD),
+            call_options_with_timeout(LONG_DEADLINE),
+        )
+        .await;
+    let req = WrappedEchoRequest(EchoRequest {
+        message: "hello".into(),
+    });
+    tx.send(
+        &req,
+        SendOptions {
+            final_msg: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let item = rx.recv(&mut resp).await;
+    assert!(
+        matches!(item, ResponseStreamItem::Headers(_)),
+        "Expected Headers, got {item:?}"
+    );
+    let item = rx.recv(&mut resp).await;
+    assert!(
+        matches!(item, ResponseStreamItem::Message),
+        "Expected Message, got {item:?}"
+    );
+    assert_eq!(resp.0.message, "hello");
+    let item = rx.recv(&mut resp).await;
+    let ResponseStreamItem::Trailers(trailers) = item else {
+        panic!("Expected Trailers, got {item:?}");
+    };
+    assert!(
+        trailers.status().is_ok(),
+        "RPC failed: {:?}",
+        trailers.status()
+    );
+
+    // Let the deadline pass; the finished stream must stay closed.
+    time::sleep(LONG_DEADLINE * 2).await;
+    let item = rx.recv(&mut resp).await;
+    assert!(
+        matches!(item, ResponseStreamItem::StreamClosed),
+        "Expected StreamClosed, got {item:?}"
+    );
+
+    shutdown_notify.notify_one();
+    server_handle.await.unwrap();
+}
+
+// Tests that an RPC whose deadline has already passed fails immediately with
+// DEADLINE_EXCEEDED without creating a stream on the server.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_deadline_already_expired() {
+    let (addr, mut streams) = start_raw_h2_server().await;
+    let conn = connect_tonic_transport(addr).await;
+
+    let mut options = CallOptions::new();
+    options.set_deadline(Instant::now() - Duration::from_secs(1));
+    let (mut tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(UNARY_METHOD),
+            options,
+        )
+        .await;
+
+    assert_recv_deadline_exceeded(&mut rx).await;
+    let req = WrappedEchoRequest(EchoRequest::default());
+    assert!(tx.send(&req, SendOptions::default()).await.is_err());
+
+    // Start a second call with no deadline.  It is the first stream the
+    // server sees, which shows the expired call never created a stream.
+    let (_tx2, _rx2) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(BIDI_METHOD),
+            CallOptions::default(),
+        )
+        .await;
+    let (request, _respond) = streams.recv().await.unwrap();
+    assert_eq!(request.uri().path(), BIDI_METHOD);
+}
+
+// Tests that when a deadline expires before ResponseHeaders are yielded to the
+// caller, the resulting DEADLINE_EXCEEDED Trailers still carries ConnectionInfo.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_deadline_exceeded_before_headers_preserves_connection_info() {
+    let (addr, mut streams) = start_raw_h2_server().await;
+    let conn = connect_tonic_transport(addr).await;
+
+    let (_tx, mut rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(BIDI_METHOD),
+            call_options_with_timeout(LONG_DEADLINE),
+        )
+        .await;
+
+    // Wait for the deadline to expire while awaiting response headers.
+    let (_request, mut respond) = streams.recv().await.unwrap();
+    assert_eq!(wait_for_reset(&mut respond).await, Reason::CANCEL);
+
+    let mut resp = WrappedEchoResponse(EchoResponse::default());
+    let ResponseStreamItem::Trailers(trailers) = rx.recv(&mut resp).await else {
+        panic!("Expected Trailers");
+    };
+    let status = trailers.status().as_ref().unwrap_err();
+    assert_eq!(status.code(), StatusCodeError::DeadlineExceeded);
+    assert!(
+        trailers.connection_info().is_some(),
+        "trailers must contain connection_info when no ResponseHeaders were yielded"
+    );
+}
+
+// Tests that dropping `TonicRecvStream` after half-closing the request stream
+// while awaiting response headers immediately resets the stream and stops the
+// deadline enforcer without waiting for the deadline.
+#[tokio::test(start_paused = true)]
+async fn tonic_transport_recv_drop_stops_deadline_enforcer_awaiting_headers() {
+    let (addr, mut streams) = start_raw_h2_server().await;
+    let conn = connect_tonic_transport(addr).await;
+
+    let start = time::Instant::now();
+    let (mut tx, rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new().with_method_name(UNARY_METHOD),
+            call_options_with_timeout(LONG_DEADLINE),
+        )
+        .await;
+    let req = WrappedEchoRequest(EchoRequest {
+        message: "hello".into(),
+    });
+    tx.send(
+        &req,
+        SendOptions {
+            final_msg: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let (request, mut respond) = streams.recv().await.unwrap();
+    let mut body = request.into_body();
+    read_request_to_end(&mut body).await;
+
+    drop(rx);
+
+    assert_eq!(wait_for_reset(&mut respond).await, Reason::CANCEL);
+    assert!(
+        start.elapsed() < LONG_DEADLINE,
+        "stream should be reset immediately on drop, not at the deadline"
+    );
+}
+
+
