@@ -42,7 +42,14 @@ use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
 use crate::client::Invoke;
+use crate::client::RecvStream;
 use crate::client::RequestHeaders;
+use crate::client::ResponseStreamItem;
+use crate::client::SendOptions;
+use crate::client::SendStream;
+use crate::client::deadline::DeadlineRecvStream;
+use crate::client::deadline::DeadlineSendStream;
+use crate::client::deadline::invoke_with_deadline;
 use crate::client::load_balancing::LbPolicy as _;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickOptions;
@@ -77,6 +84,9 @@ use crate::client::transport::TransportRegistry;
 #[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
 use crate::core::Address;
+use crate::core::RecvMessage;
+use crate::core::SendMessage;
+use crate::core::StreamEnded;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
@@ -175,8 +185,8 @@ impl Channel {
 }
 
 impl Invoke for Channel {
-    type SendStream = Box<dyn DynSendStream>;
-    type RecvStream = Box<dyn DynRecvStream>;
+    type SendStream = ChannelSendStream;
+    type RecvStream = ChannelRecvStream;
 
     async fn invoke(
         &self,
@@ -184,7 +194,30 @@ impl Invoke for Channel {
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
         let ac = self.inner.get_active_channel();
-        ac.invoke(headers, options).await
+        let (tx, rx) = invoke_with_deadline(&self.inner.runtime, headers, options, &ac).await;
+        (ChannelSendStream(tx), ChannelRecvStream(rx))
+    }
+}
+
+/// The [`SendStream`] of an RPC started on a [`Channel`].
+pub struct ChannelSendStream(DeadlineSendStream<Box<dyn DynSendStream>>);
+
+impl SendStream for ChannelSendStream {
+    async fn send(
+        &mut self,
+        msg: &dyn SendMessage,
+        options: SendOptions,
+    ) -> Result<(), StreamEnded> {
+        self.0.send(msg, options).await
+    }
+}
+
+/// The [`RecvStream`] of an RPC started on a [`Channel`].
+pub struct ChannelRecvStream(DeadlineRecvStream<Box<dyn DynSendStream>, Box<dyn DynRecvStream>>);
+
+impl RecvStream for ChannelRecvStream {
+    async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
+        self.0.recv(msg).await
     }
 }
 
