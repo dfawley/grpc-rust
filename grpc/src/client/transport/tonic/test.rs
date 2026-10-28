@@ -54,6 +54,7 @@ use crate::async_trait;
 use crate::attributes::Attributes;
 use crate::client::CallOptions;
 use crate::client::Channel;
+use crate::client::DynInvoke;
 use crate::client::Invoke as _;
 use crate::client::RecvStream as _;
 use crate::client::RequestHeaders;
@@ -132,49 +133,9 @@ const DEFAULT_TEST_SHORT_DURATION: Duration = Duration::from_millis(10);
 #[tokio::test]
 pub(crate) async fn tonic_transport_rpc() {
     super::reg();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap(); // get the assigned address
-    let shutdown_notify = Arc::new(Notify::new());
-    let shutdown_notify_copy = shutdown_notify.clone();
-    println!("EchoServer listening on: {addr}");
-    let server_handle = tokio::spawn(async move {
-        let echo_server = EchoService {
-            response_headers: None,
-            response_error: None,
-        };
-        let svc = EchoServer::new(echo_server);
-        let _ = Server::builder()
-            .add_service(svc)
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                shutdown_notify_copy.notified(),
-            )
-            .await;
-    });
-
-    let builder = GLOBAL_TRANSPORT_REGISTRY
-        .get_transport(TCP_IP_NETWORK_TYPE)
-        .unwrap();
-    let config = Arc::new(TransportOptions::default());
-    let securty_opts = SecurityOpts {
-        credentials: LocalChannelCredentials::new_arc(),
-        authority: Authority::new("localhost".to_string(), None),
-        handshake_info: ClientHandshakeInfo::default(),
-    };
-    let address = Address {
-        network_type: TCP_IP_NETWORK_TYPE,
-        address: addr.to_string().into(),
-        attributes: Attributes::new(),
-    };
-    let (conn, _sec_info, mut disconnection_listener) = builder
-        .dyn_connect(
-            &address,
-            GrpcRuntime::new(TokioRuntime::default()),
-            &securty_opts,
-            &config,
-        )
-        .await
-        .unwrap();
+    let server = EchoServerHandle::start().await;
+    println!("EchoServer listening on: {}", server.addr);
+    let (conn, mut disconnection_listener) = connect_transport(server.addr).await;
 
     let (mut tx, mut rx) = conn
         .dyn_invoke(
@@ -227,38 +188,20 @@ pub(crate) async fn tonic_transport_rpc() {
         disconnection_listener.try_recv(),
         Err(oneshot::error::TryRecvError::Empty),
     );
-    shutdown_notify.notify_waiters();
+    server.shutdown.notify_waiters();
     let res = GrpcRuntime::default()
         .timeout(DEFAULT_TEST_DURATION, disconnection_listener)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(res, Ok(()));
-    server_handle.await.unwrap();
+    server.task.await.unwrap();
 }
 
 #[tokio::test]
 async fn grpc_invoke_tonic_unary() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let shutdown_notify = Arc::new(Notify::new());
-    let shutdown_notify_copy = shutdown_notify.clone();
-
-    // Spawn a task for the server.
-    let server_handle = tokio::spawn(async move {
-        let echo_server = EchoService {
-            response_headers: None,
-            response_error: None,
-        };
-        let svc = EchoServer::new(echo_server);
-        let _ = Server::builder()
-            .add_service(svc)
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                shutdown_notify_copy.notified(),
-            )
-            .await;
-    });
+    let server = EchoServerHandle::start().await;
+    let addr = server.addr;
 
     // Create the channel.
     let target = format!("dns:///{}", addr);
@@ -296,8 +239,7 @@ async fn grpc_invoke_tonic_unary() {
         trailers.status()
     );
 
-    shutdown_notify.notify_one();
-    server_handle.await.unwrap();
+    server.shutdown().await;
 }
 
 #[cfg(unix)]
@@ -452,25 +394,8 @@ mod unix_tests {
 
 #[tokio::test]
 async fn grpc_invoke_failure_cases() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let shutdown_notify = Arc::new(Notify::new());
-    let shutdown_notify_copy = shutdown_notify.clone();
-
-    tokio::spawn(async move {
-        let echo_server = EchoService {
-            response_headers: None,
-            response_error: None,
-        };
-        let svc = EchoServer::new(echo_server);
-        let _ = Server::builder()
-            .add_service(svc)
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                shutdown_notify_copy.notified(),
-            )
-            .await;
-    });
+    let server = EchoServerHandle::start().await;
+    let addr = server.addr;
 
     let target = format!("dns:///{}", addr);
 
@@ -590,7 +515,7 @@ async fn grpc_invoke_failure_cases() {
         assert_eq!(connection_info.security_info().security_protocol(), "local");
     }
 
-    shutdown_notify.notify_one();
+    server.shutdown().await;
 }
 
 async fn perform_unary_echo(
@@ -664,10 +589,6 @@ async fn perform_unary_echo_failure(channel: &Channel) -> Trailers {
 #[tokio::test]
 async fn tonic_transport_invalid_base64_headers() {
     super::reg();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let shutdown_notify = Arc::new(Notify::new());
-    let shutdown_notify_copy = shutdown_notify.clone();
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -676,44 +597,14 @@ async fn tonic_transport_invalid_base64_headers() {
     );
     let response_headers = Some(TonicMetadata::from_headers(headers));
 
-    let server_handle = tokio::spawn(async move {
-        let echo_server = EchoService {
-            response_headers,
-            response_error: None,
-        };
-        let svc = EchoServer::new(echo_server);
-        let _ = Server::builder()
-            .add_service(svc)
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                shutdown_notify_copy.notified(),
-            )
-            .await;
-    });
+    let server = EchoServerHandle::start_with(EchoService {
+        response_headers,
+        response_error: None,
+    })
+    .await;
+    let addr = server.addr;
 
-    let builder = GLOBAL_TRANSPORT_REGISTRY
-        .get_transport(TCP_IP_NETWORK_TYPE)
-        .unwrap();
-    let config = Arc::new(TransportOptions::default());
-    let securty_opts = SecurityOpts {
-        credentials: LocalChannelCredentials::new_arc(),
-        authority: Authority::new("localhost".to_string(), None),
-        handshake_info: ClientHandshakeInfo::default(),
-    };
-    let address = Address {
-        network_type: TCP_IP_NETWORK_TYPE,
-        address: addr.to_string().into(),
-        attributes: Attributes::new(),
-    };
-    let (conn, _sec_info, _disconnection_listener) = builder
-        .dyn_connect(
-            &address,
-            GrpcRuntime::new(TokioRuntime::default()),
-            &securty_opts,
-            &config,
-        )
-        .await
-        .unwrap();
+    let (conn, _disconnection_listener) = connect_transport(addr).await;
 
     let (mut tx, mut rx) = conn
         .dyn_invoke(
@@ -746,56 +637,17 @@ async fn tonic_transport_invalid_base64_headers() {
         .await
         .expect("timed out waiting for stream to close");
 
-    shutdown_notify.notify_one();
-    server_handle.await.unwrap();
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn tonic_transport_recv_drop_cancels_send() {
     super::reg();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let shutdown_notify = Arc::new(Notify::new());
-    let shutdown_notify_copy = shutdown_notify.clone();
 
-    let server_handle = tokio::spawn(async move {
-        let echo_server = EchoService {
-            response_headers: None,
-            response_error: None,
-        };
-        let svc = EchoServer::new(echo_server);
-        let _ = Server::builder()
-            .add_service(svc)
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                shutdown_notify_copy.notified(),
-            )
-            .await;
-    });
+    let server = EchoServerHandle::start().await;
+    let addr = server.addr;
 
-    let builder = GLOBAL_TRANSPORT_REGISTRY
-        .get_transport(TCP_IP_NETWORK_TYPE)
-        .unwrap();
-    let config = Arc::new(TransportOptions::default());
-    let securty_opts = SecurityOpts {
-        credentials: LocalChannelCredentials::new_arc(),
-        authority: Authority::new("localhost".to_string(), None),
-        handshake_info: ClientHandshakeInfo::default(),
-    };
-    let address = Address {
-        network_type: TCP_IP_NETWORK_TYPE,
-        address: addr.to_string().into(),
-        attributes: Attributes::new(),
-    };
-    let (conn, _sec_info, _disconnection_listener) = builder
-        .dyn_connect(
-            &address,
-            GrpcRuntime::new(TokioRuntime::default()),
-            &securty_opts,
-            &config,
-        )
-        .await
-        .unwrap();
+    let (conn, _disconnection_listener) = connect_transport(addr).await;
 
     let (mut tx, rx) = conn
         .dyn_invoke(
@@ -819,8 +671,7 @@ async fn tonic_transport_recv_drop_cancels_send() {
         .await
         .expect("timed out waiting for stream to close");
 
-    shutdown_notify.notify_one();
-    server_handle.await.unwrap();
+    server.shutdown().await;
 }
 
 #[derive(Debug, Clone)]
@@ -872,25 +723,8 @@ impl ChannelCredentials for SlowChannelCredentials {
 
 #[tokio::test(start_paused = true)]
 async fn connect_timeout_exceeded() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let shutdown_notify = Arc::new(Notify::new());
-    let shutdown_notify_copy = shutdown_notify.clone();
-
-    let server_handle = tokio::spawn(async move {
-        let echo_server = EchoService {
-            response_headers: None,
-            response_error: None,
-        };
-        let svc = EchoServer::new(echo_server);
-        let _ = Server::builder()
-            .add_service(svc)
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                shutdown_notify_copy.notified(),
-            )
-            .await;
-    });
+    let server = EchoServerHandle::start().await;
+    let addr = server.addr;
 
     // Create the channel with SlowChannelCredentials (21s).
     // The default timeout is 20s.
@@ -914,17 +748,11 @@ async fn connect_timeout_exceeded() {
     let status = trailers.status().as_ref().unwrap_err();
     assert_eq!(status.code(), StatusCodeError::Unavailable);
 
-    shutdown_notify.notify_one();
-    server_handle.await.unwrap();
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn trailers_only_metadata() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let shutdown_notify = Arc::new(Notify::new());
-    let shutdown_notify_copy = shutdown_notify.clone();
-
     // Prepare custom metadata for the server response.
     let mut metadata = TonicMetadata::new();
     metadata.insert(
@@ -935,20 +763,12 @@ async fn trailers_only_metadata() {
     let status =
         TonicStatus::with_metadata(tonic::Code::InvalidArgument, "test error message", metadata);
 
-    let server_handle = tokio::spawn(async move {
-        let echo_server = EchoService {
-            response_headers: None,
-            response_error: Some(status),
-        };
-        let svc = EchoServer::new(echo_server);
-        let _ = Server::builder()
-            .add_service(svc)
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                shutdown_notify_copy.notified(),
-            )
-            .await;
-    });
+    let server = EchoServerHandle::start_with(EchoService {
+        response_headers: None,
+        response_error: Some(status),
+    })
+    .await;
+    let addr = server.addr;
 
     let target = format!("dns:///{}", addr);
     let channel = Channel::builder(&target, LocalChannelCredentials::new_arc()).build();
@@ -976,8 +796,7 @@ async fn trailers_only_metadata() {
         addr.to_string()
     );
 
-    shutdown_notify.notify_one();
-    server_handle.await.unwrap();
+    server.shutdown().await;
 }
 
 // Verifies that trailer metadata is preserved when the server returns an error
@@ -1174,6 +993,82 @@ impl Echo for EchoService {
     }
 }
 
+/// A tonic echo server for tests.
+struct EchoServerHandle {
+    addr: SocketAddr,
+    shutdown: Arc<Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl EchoServerHandle {
+    /// Starts a default echo server listening on a local port.
+    async fn start() -> Self {
+        Self::start_with(EchoService {
+            response_headers: None,
+            response_error: None,
+        })
+        .await
+    }
+
+    /// Starts `echo_service` listening on a local port.
+    async fn start_with(echo_service: EchoService) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_copy = shutdown.clone();
+        let task = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(EchoServer::new(echo_service))
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    shutdown_copy.notified(),
+                )
+                .await;
+        });
+        Self {
+            addr,
+            shutdown,
+            task,
+        }
+    }
+
+    /// Stops the server and waits for it to exit.
+    async fn shutdown(self) {
+        self.shutdown.notify_one();
+        self.task.await.unwrap();
+    }
+}
+
+/// Connects the tonic transport directly to `addr`, bypassing the channel.
+/// Returns the connection and its disconnection listener.
+async fn connect_transport(
+    addr: SocketAddr,
+) -> (Box<dyn DynInvoke>, oneshot::Receiver<Result<(), String>>) {
+    let builder = GLOBAL_TRANSPORT_REGISTRY
+        .get_transport(TCP_IP_NETWORK_TYPE)
+        .unwrap();
+    let security_opts = SecurityOpts {
+        credentials: LocalChannelCredentials::new_arc(),
+        authority: Authority::new("localhost".to_string(), None),
+        handshake_info: ClientHandshakeInfo::default(),
+    };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
+    let (conn, _sec_info, disconnection_listener) = builder
+        .dyn_connect(
+            &address,
+            GrpcRuntime::new(TokioRuntime::default()),
+            &security_opts,
+            &TransportOptions::default(),
+        )
+        .await
+        .unwrap();
+    (conn, disconnection_listener)
+}
+
 #[tokio::test]
 async fn tonic_transport_recv_drop_sends_rst_stream() {
     super::reg();
@@ -1202,30 +1097,7 @@ async fn tonic_transport_recv_drop_sends_rst_stream() {
         }
     });
 
-    let builder = GLOBAL_TRANSPORT_REGISTRY
-        .get_transport(TCP_IP_NETWORK_TYPE)
-        .unwrap();
-    let config = Arc::new(TransportOptions::default());
-    let securty_opts = SecurityOpts {
-        credentials: LocalChannelCredentials::new_arc(),
-        authority: Authority::new("localhost".to_string(), None),
-        handshake_info: ClientHandshakeInfo::default(),
-    };
-    let address = Address {
-        network_type: TCP_IP_NETWORK_TYPE,
-        address: addr.to_string().into(),
-        attributes: Attributes::new(),
-    };
-
-    let (conn, _sec_info, _disconnection_listener) = builder
-        .dyn_connect(
-            &address,
-            GrpcRuntime::new(TokioRuntime::default()),
-            &securty_opts,
-            &config,
-        )
-        .await
-        .unwrap();
+    let (conn, _disconnection_listener) = connect_transport(addr).await;
 
     let (mut tx, rx) = conn
         .dyn_invoke(
