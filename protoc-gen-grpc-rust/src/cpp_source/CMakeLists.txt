@@ -41,7 +41,7 @@ include(FetchProtobuf)
 
 # Download and configure abseil
 # Abseil version that's compatible with protobuf
-set(ABSEIL_VERSION "20260817.0")
+set(ABSEIL_VERSION "20250512.2")
 set(ABSEIL_URL "https://github.com/abseil/abseil-cpp/archive/refs/tags/${ABSEIL_VERSION}.tar.gz")
 
 message(STATUS "Downloading abseil-cpp ${ABSEIL_VERSION}")
@@ -49,7 +49,7 @@ message(STATUS "Downloading abseil-cpp ${ABSEIL_VERSION}")
 FetchContent_Declare(
     absl
     URL ${ABSEIL_URL}
-    URL_HASH SHA256=f7e05179df39c45434cad433f5783840bb3788ef322976f9138bc6b72b3a107d
+    URL_HASH SHA256=71358f2e72e945d280bfab44090eacb3f98e10fead31fd97876f05a835510d92
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 
