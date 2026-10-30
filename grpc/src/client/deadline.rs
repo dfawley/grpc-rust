@@ -28,7 +28,10 @@
 //! responsibility of the transport, which can compute the timeout immediately
 //! before the request headers are written.
 
+use std::future::poll_fn;
 use std::pin::Pin;
+use std::pin::pin;
+use std::task::Poll;
 use std::time::Instant;
 
 use tokio::sync::oneshot;
@@ -99,13 +102,16 @@ pub(crate) async fn invoke_with_deadline<I: InvokeOnce>(
     (
         DeadlineSendStream {
             tx: Some(tx),
-            deadline,
+            deadline: Deadline::new(runtime, call_deadline),
             park_tx: Some(park_tx),
         },
+        // Reuse the exisitng `deadline` here as `send` is less likely to need
+        // to create a `sleep` internally (it writes to a buffer/channel
+        // internally) than `recv` (it reads from the network).
         DeadlineRecvStream(RecvState::Active {
             rx,
             parked_tx,
-            deadline: Deadline::new(runtime, call_deadline),
+            deadline,
         }),
     )
 }
@@ -118,9 +124,11 @@ enum Deadline {
     Pending {
         runtime: GrpcRuntime,
         deadline: Instant,
-        /// Completes when the deadline expires.  Always discarded upon
-        /// expiration to avoid polling after completion.
-        sleep: Pin<Box<dyn Sleep>>,
+        /// Completes when the deadline expires.  Created lazily, the first
+        /// time an operation has to wait, since most `invoke` and `send`
+        /// operations complete immediately.  Always discarded upon expiration
+        /// to avoid polling after completion.
+        sleep: Option<Pin<Box<dyn Sleep>>>,
     },
     /// The deadline has expired.
     Expired,
@@ -134,7 +142,7 @@ impl Deadline {
             Some(deadline) => Self::Pending {
                 runtime: runtime.clone(),
                 deadline,
-                sleep: runtime.sleep(deadline.saturating_duration_since(runtime.now())),
+                sleep: None,
             },
         }
     }
@@ -153,11 +161,33 @@ impl Deadline {
     }
 
     /// Runs `fut` until it completes, or fails with DeadlineExceeded if the
-    /// deadline expires first.
+    /// deadline expires first.  If the deadline has already expired, `fut` is
+    /// not polled.
     async fn run<F: Future>(&mut self, fut: F) -> Result<F::Output, StatusError> {
         match self {
             Self::None => Ok(fut.await),
-            Self::Pending { sleep, .. } => {
+            Self::Pending {
+                runtime,
+                deadline,
+                sleep,
+            } => {
+                let deadline = *deadline;
+                // Check the clock explicitly rather than relying on `sleep`
+                // alone: a sleep is not ready on its first poll (when tokio
+                // registers its timer), however far past due it is.
+                if runtime.now() >= deadline {
+                    *self = Self::Expired;
+                    return Err(deadline_exceeded());
+                }
+                // Poll `fut` once before creating `sleep`, so that operations
+                // that complete immediately don't need a timer.
+                let mut fut = pin!(fut);
+                if let Poll::Ready(out) = poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await {
+                    return Ok(out);
+                }
+                let sleep = sleep.get_or_insert_with(|| {
+                    runtime.sleep(deadline.saturating_duration_since(runtime.now()))
+                });
                 tokio::select! {
                     biased;
                     _ = sleep.as_mut() => {
@@ -476,6 +506,24 @@ mod tests {
 
         assert_deadline_exceeded(rx.recv(&mut NopRecvMessage).await);
         assert_eq!(invoker.events(), ["invoke", "rx dropped", "tx dropped"]);
+        assert_closed(rx.recv(&mut NopRecvMessage).await);
+    }
+
+    // Verifies that a response that is already available is not returned if
+    // the deadline expires before the application reads it.
+    #[tokio::test(start_paused = true)]
+    async fn response_read_after_deadline_is_not_returned() {
+        let invoker = FakeInvoker {
+            recv_items: Mutex::new(VecDeque::from([
+                ResponseStreamItem::Message,
+                ResponseStreamItem::Trailers(Trailers::new(Ok(()))),
+            ])),
+            ..Default::default()
+        };
+        let (_tx, mut rx) = invoke(&invoker, runtime().now() + TIMEOUT).await;
+
+        runtime().sleep(TIMEOUT * 2).await;
+        assert_deadline_exceeded(rx.recv(&mut NopRecvMessage).await);
         assert_closed(rx.recv(&mut NopRecvMessage).await);
     }
 
