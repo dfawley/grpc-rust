@@ -38,10 +38,7 @@ use tokio::sync::oneshot;
 
 use crate::StatusCodeError;
 use crate::StatusError;
-use crate::client::CallOptions;
-use crate::client::InvokeOnce;
 use crate::client::RecvStream;
-use crate::client::RequestHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
@@ -56,7 +53,7 @@ fn deadline_exceeded() -> StatusError {
     StatusError::new(StatusCodeError::DeadlineExceeded, "deadline exceeded")
 }
 
-/// Starts a call on `next`, enforcing the deadline in `options`, if any.
+/// Starts a call by running `start`, enforcing `deadline`, if any.
 ///
 /// To avoid the cost of spawning a timer task per call, the deadline is only
 /// enforced while the call is starting or a stream is actively being used:
@@ -75,20 +72,15 @@ fn deadline_exceeded() -> StatusError {
 /// [`SendStream`] is not dropped until the underlying [`RecvStream`] is, which
 /// avoids sending a half-close instead.
 ///
-/// If `options` has no deadline, the returned streams are simply pass-through
-/// wrappers of `next`'s streams.
-pub(crate) async fn invoke_with_deadline<I: InvokeOnce>(
+/// If `deadline` is `None`, the returned streams are simply pass-through
+/// wrappers of the streams produced by `start`.
+pub(crate) async fn invoke_with_deadline<SS, RS>(
     runtime: &GrpcRuntime,
-    headers: RequestHeaders,
-    options: CallOptions,
-    next: I,
-) -> (
-    DeadlineSendStream<I::SendStream>,
-    DeadlineRecvStream<I::SendStream, I::RecvStream>,
-) {
-    let call_deadline = options.deadline();
+    call_deadline: Option<Instant>,
+    start: impl Future<Output = (SS, RS)>,
+) -> (DeadlineSendStream<SS>, DeadlineRecvStream<SS, RS>) {
     let mut deadline = Deadline::new(runtime, call_deadline);
-    let Ok((tx, rx)) = deadline.run(next.invoke_once(headers, options)).await else {
+    let Ok((tx, rx)) = deadline.run(start).await else {
         return (
             DeadlineSendStream {
                 tx: None,
@@ -298,7 +290,9 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+    use crate::client::CallOptions;
     use crate::client::Invoke;
+    use crate::client::RequestHeaders;
     use crate::client::test_util::ByteSendMsg;
     use crate::client::test_util::NopRecvMessage;
     use crate::rt::tokio::TokioRuntime;
@@ -404,11 +398,12 @@ mod tests {
         DeadlineSendStream<FakeSendStream>,
         DeadlineRecvStream<FakeSendStream, FakeRecvStream>,
     ) {
-        let mut options = CallOptions::new();
-        if let Some(deadline) = deadline.into() {
-            options.set_deadline(deadline);
-        }
-        invoke_with_deadline(&runtime(), RequestHeaders::new(), options, invoker).await
+        invoke_with_deadline(
+            &runtime(),
+            deadline.into(),
+            invoker.invoke(RequestHeaders::new(), CallOptions::new()),
+        )
+        .await
     }
 
     async fn send(tx: &mut impl SendStream) -> Result<(), StreamEnded> {
