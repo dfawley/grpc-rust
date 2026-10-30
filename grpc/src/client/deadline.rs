@@ -39,14 +39,13 @@ use tokio::sync::oneshot;
 use crate::StatusCodeError;
 use crate::StatusError;
 use crate::client::CallOptions;
-use crate::client::InvokeOnce;
+use crate::client::Invoke;
 use crate::client::RecvStream;
 use crate::client::RequestHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
 use crate::client::Trailers;
-use crate::client::interceptor::Intercept;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::core::StreamEnded;
@@ -57,7 +56,8 @@ fn deadline_exceeded() -> StatusError {
     StatusError::new(StatusCodeError::DeadlineExceeded, "deadline exceeded")
 }
 
-/// An interceptor that enforces the deadline in each call's [`CallOptions`].
+/// Starts calls on another layer, enforcing the deadline in each call's
+/// [`CallOptions`].
 ///
 /// To avoid the cost of spawning a timer task per call, the deadline is only
 /// enforced while the call is starting or a stream is actively being used:
@@ -78,32 +78,35 @@ fn deadline_exceeded() -> StatusError {
 ///
 /// If a call has no deadline, its streams are simply pass-through wrappers of
 /// the underlying streams.
-pub(crate) struct DeadlineInterceptor<'a> {
-    runtime: &'a GrpcRuntime,
+pub(crate) struct DeadlineInvoker<I> {
+    runtime: GrpcRuntime,
+    next: I,
 }
 
-impl<'a> DeadlineInterceptor<'a> {
-    pub(crate) fn new(runtime: &'a GrpcRuntime) -> Self {
-        Self { runtime }
+impl<I> DeadlineInvoker<I> {
+    /// Returns a `DeadlineInvoker` that starts calls on `next`.
+    pub(crate) fn new(runtime: GrpcRuntime, next: I) -> Self {
+        Self { runtime, next }
+    }
+
+    /// Returns the layer that calls are started on.
+    pub(crate) fn next(&self) -> &I {
+        &self.next
     }
 }
 
-impl<I> Intercept<I> for DeadlineInterceptor<'_>
-where
-    I: InvokeOnce,
-{
+impl<I: Invoke> Invoke for DeadlineInvoker<I> {
     type SendStream = DeadlineSendStream<I::SendStream>;
     type RecvStream = DeadlineRecvStream<I::SendStream, I::RecvStream>;
 
-    async fn intercept(
+    async fn invoke(
         &self,
         headers: RequestHeaders,
         options: CallOptions,
-        next: I,
     ) -> (Self::SendStream, Self::RecvStream) {
         let call_deadline = options.deadline();
-        let mut deadline = Deadline::new(self.runtime, call_deadline);
-        let Ok((tx, rx)) = deadline.run(next.invoke_once(headers, options)).await else {
+        let mut deadline = Deadline::new(&self.runtime, call_deadline);
+        let Ok((tx, rx)) = deadline.run(self.next.invoke(headers, options)).await else {
             return (
                 DeadlineSendStream {
                     tx: None,
@@ -117,7 +120,7 @@ where
         (
             DeadlineSendStream {
                 tx: Some(tx),
-                deadline: Deadline::new(self.runtime, call_deadline),
+                deadline: Deadline::new(&self.runtime, call_deadline),
                 park_tx: Some(park_tx),
             },
             // Reuse the exisitng `deadline` here as `send` is less likely to need
@@ -314,9 +317,6 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::client::CallOptions;
-    use crate::client::Invoke;
-    use crate::client::RequestHeaders;
     use crate::client::test_util::ByteSendMsg;
     use crate::client::test_util::NopRecvMessage;
     use crate::rt::tokio::TokioRuntime;
@@ -342,7 +342,9 @@ mod tests {
         }
     }
 
-    impl Invoke for FakeInvoker {
+    // Implemented on a reference so that tests can inspect the invoker after
+    // passing it to a `DeadlineInvoker`.
+    impl Invoke for &FakeInvoker {
         type SendStream = FakeSendStream;
         type RecvStream = FakeRecvStream;
 
@@ -426,8 +428,8 @@ mod tests {
         if let Some(deadline) = deadline.into() {
             options.set_deadline(deadline);
         }
-        DeadlineInterceptor::new(&runtime())
-            .intercept(RequestHeaders::new(), options, invoker)
+        DeadlineInvoker::new(runtime(), invoker)
+            .invoke(RequestHeaders::new(), options)
             .await
     }
 
