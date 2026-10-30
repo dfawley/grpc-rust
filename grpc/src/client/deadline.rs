@@ -38,11 +38,15 @@ use tokio::sync::oneshot;
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::client::CallOptions;
+use crate::client::InvokeOnce;
 use crate::client::RecvStream;
+use crate::client::RequestHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
 use crate::client::Trailers;
+use crate::client::interceptor::Intercept;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::core::StreamEnded;
@@ -53,7 +57,7 @@ fn deadline_exceeded() -> StatusError {
     StatusError::new(StatusCodeError::DeadlineExceeded, "deadline exceeded")
 }
 
-/// Starts a call by running `start`, enforcing `deadline`, if any.
+/// An interceptor that enforces the deadline in each call's [`CallOptions`].
 ///
 /// To avoid the cost of spawning a timer task per call, the deadline is only
 /// enforced while the call is starting or a stream is actively being used:
@@ -72,40 +76,60 @@ fn deadline_exceeded() -> StatusError {
 /// [`SendStream`] is not dropped until the underlying [`RecvStream`] is, which
 /// avoids sending a half-close instead.
 ///
-/// If `deadline` is `None`, the returned streams are simply pass-through
-/// wrappers of the streams produced by `start`.
-pub(crate) async fn invoke_with_deadline<SS, RS>(
-    runtime: &GrpcRuntime,
-    call_deadline: Option<Instant>,
-    start: impl Future<Output = (SS, RS)>,
-) -> (DeadlineSendStream<SS>, DeadlineRecvStream<SS, RS>) {
-    let mut deadline = Deadline::new(runtime, call_deadline);
-    let Ok((tx, rx)) = deadline.run(start).await else {
-        return (
+/// If a call has no deadline, its streams are simply pass-through wrappers of
+/// the underlying streams.
+pub(crate) struct DeadlineInterceptor<'a> {
+    runtime: &'a GrpcRuntime,
+}
+
+impl<'a> DeadlineInterceptor<'a> {
+    pub(crate) fn new(runtime: &'a GrpcRuntime) -> Self {
+        Self { runtime }
+    }
+}
+
+impl<I> Intercept<I> for DeadlineInterceptor<'_>
+where
+    I: InvokeOnce,
+{
+    type SendStream = DeadlineSendStream<I::SendStream>;
+    type RecvStream = DeadlineRecvStream<I::SendStream, I::RecvStream>;
+
+    async fn intercept(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+        next: I,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        let call_deadline = options.deadline();
+        let mut deadline = Deadline::new(self.runtime, call_deadline);
+        let Ok((tx, rx)) = deadline.run(next.invoke_once(headers, options)).await else {
+            return (
+                DeadlineSendStream {
+                    tx: None,
+                    deadline,
+                    park_tx: None,
+                },
+                DeadlineRecvStream(RecvState::InvokeTimeout),
+            );
+        };
+        let (park_tx, parked_tx) = oneshot::channel();
+        (
             DeadlineSendStream {
-                tx: None,
-                deadline,
-                park_tx: None,
+                tx: Some(tx),
+                deadline: Deadline::new(self.runtime, call_deadline),
+                park_tx: Some(park_tx),
             },
-            DeadlineRecvStream(RecvState::InvokeTimeout),
-        );
-    };
-    let (park_tx, parked_tx) = oneshot::channel();
-    (
-        DeadlineSendStream {
-            tx: Some(tx),
-            deadline: Deadline::new(runtime, call_deadline),
-            park_tx: Some(park_tx),
-        },
-        // Reuse the exisitng `deadline` here as `send` is less likely to need
-        // to create a `sleep` internally (it writes to a buffer/channel
-        // internally) than `recv` (it reads from the network).
-        DeadlineRecvStream(RecvState::Active {
-            rx,
-            parked_tx,
-            deadline,
-        }),
-    )
+            // Reuse the exisitng `deadline` here as `send` is less likely to need
+            // to create a `sleep` internally (it writes to a buffer/channel
+            // internally) than `recv` (it reads from the network).
+            DeadlineRecvStream(RecvState::Active {
+                rx,
+                parked_tx,
+                deadline,
+            }),
+        )
+    }
 }
 
 /// Optionally stores and tracks a deadline, and runs futures bounded by it.
@@ -398,12 +422,13 @@ mod tests {
         DeadlineSendStream<FakeSendStream>,
         DeadlineRecvStream<FakeSendStream, FakeRecvStream>,
     ) {
-        invoke_with_deadline(
-            &runtime(),
-            deadline.into(),
-            invoker.invoke(RequestHeaders::new(), CallOptions::new()),
-        )
-        .await
+        let mut options = CallOptions::new();
+        if let Some(deadline) = deadline.into() {
+            options.set_deadline(deadline);
+        }
+        DeadlineInterceptor::new(&runtime())
+            .intercept(RequestHeaders::new(), options, invoker)
+            .await
     }
 
     async fn send(tx: &mut impl SendStream) -> Result<(), StreamEnded> {

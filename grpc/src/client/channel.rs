@@ -45,14 +45,17 @@ use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
 use crate::client::Invoke;
+use crate::client::InvokeOnce;
 use crate::client::RecvStream;
 use crate::client::RequestHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
+use crate::client::deadline::DeadlineInterceptor;
 use crate::client::deadline::DeadlineRecvStream;
 use crate::client::deadline::DeadlineSendStream;
-use crate::client::deadline::invoke_with_deadline;
+use crate::client::interceptor::Intercept;
+use crate::client::interceptor::InvokeOnceExt as _;
 use crate::client::load_balancing::LbPolicy as _;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickOptions;
@@ -201,24 +204,42 @@ impl Invoke for Channel {
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
         let ac = self.inner.get_active_channel();
-        let deadline = options.deadline();
-        let start = async move {
-            let selected = ac
-                .config_selector
-                .select_config(SelectConfigOptions::default())
-                .await;
-            let config = match selected {
-                Ok(config) => config,
-                Err(status) => return FailingRecvStream::new_stream_pair(status, None),
-            };
-            match config.interceptor {
-                Some(interceptor) => interceptor.dyn_intercept(headers, options, ac).await,
-                // Avoid heap allocations and dynamic dispatch.
-                None => ac.invoke(headers, options).await,
-            }
-        };
-        let (tx, rx) = invoke_with_deadline(&self.inner.runtime, deadline, start).await;
+        let (tx, rx) = ac
+            .with_interceptor(ConfigSelectorInterceptor)
+            .with_interceptor(DeadlineInterceptor::new(&self.inner.runtime))
+            .invoke_once(headers, options)
+            .await;
         (ChannelSendStream(tx), ChannelRecvStream(rx))
+    }
+}
+
+/// Applies the config chosen by the [`ActiveChannel`]'s config selector to each
+/// RPC started on it.
+struct ConfigSelectorInterceptor;
+
+impl Intercept<Arc<ActiveChannel>> for ConfigSelectorInterceptor {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn intercept(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+        ac: Arc<ActiveChannel>,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        let selected = ac
+            .config_selector
+            .select_config(SelectConfigOptions::default())
+            .await;
+        let config = match selected {
+            Ok(config) => config,
+            Err(status) => return FailingRecvStream::new_stream_pair(status, None),
+        };
+        match config.interceptor {
+            Some(interceptor) => interceptor.dyn_intercept(headers, options, ac).await,
+            // Avoid heap allocations and dynamic dispatch.
+            None => ac.invoke(headers, options).await,
+        }
     }
 }
 
@@ -479,6 +500,19 @@ impl DynInvoke for ActiveChannel {
         headers: RequestHeaders,
         options: CallOptions,
     ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+        self.invoke(headers, options).await
+    }
+}
+
+impl InvokeOnce for Arc<ActiveChannel> {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn invoke_once(
+        self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
         self.invoke(headers, options).await
     }
 }
