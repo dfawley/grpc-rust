@@ -266,7 +266,7 @@ mod tests {
         ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
             // The test may have stopped listening.
             let _ = self.intercepted_tx.send(());
-            next.dyn_invoke(headers, options).await
+            (*next).dyn_invoke(headers, options).await
         }
     }
 

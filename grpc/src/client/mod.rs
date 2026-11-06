@@ -49,6 +49,7 @@
 //!   trailers received from the server during its response.
 
 use std::fmt::Display;
+use std::sync::Arc;
 
 use crate::async_trait;
 use crate::core::ConnectionInfo;
@@ -167,6 +168,30 @@ impl<T: Invoke> DynInvoke for T {
     ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
         let (tx, rx) = self.invoke(headers, options).await;
         (Box::new(tx), Box::new(rx))
+    }
+}
+
+/// Allows a type-erased [`DynInvoke`] to be used wherever an [`Invoke`] is
+/// expected, e.g. with generated client stubs.
+///
+/// Note that, through the blanket `DynInvoke` impl for `Invoke` types, this
+/// also makes `Arc<dyn DynInvoke>` itself a `DynInvoke`, so method syntax on
+/// an `Arc<dyn DynInvoke>` (`arc.dyn_invoke(..)`) resolves to that impl,
+/// which boxes the streams a second time.  Call `(*arc).dyn_invoke(..)` to
+/// use the inner object directly.
+impl Invoke for Arc<dyn DynInvoke> {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        // Call the inner trait object explicitly: `self.dyn_invoke` would
+        // resolve to the blanket `DynInvoke` impl for this `Arc` (via this
+        // `Invoke` impl) and recurse forever.
+        (**self).dyn_invoke(headers, options).await
     }
 }
 
@@ -528,5 +553,57 @@ impl Trailers {
 
     pub(crate) fn into_parts(self) -> (crate::Result<()>, MetadataMap) {
         (self.status, self.metadata)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::StatusCodeError;
+    use crate::StatusError;
+    use crate::client::stream_util::FailingRecvStream;
+
+    /// Counts calls, and returns streams that fail immediately.
+    struct CountingInvoke(AtomicUsize);
+
+    #[async_trait]
+    impl DynInvoke for CountingInvoke {
+        async fn dyn_invoke(
+            &self,
+            _: RequestHeaders,
+            _: CallOptions,
+        ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            FailingRecvStream::new_stream_pair(
+                StatusError::new(StatusCodeError::Unavailable, "test"),
+                None,
+            )
+        }
+    }
+
+    async fn invoke_generic<T: Invoke>(t: &T) {
+        let _ = t
+            .invoke(RequestHeaders::default(), CallOptions::new())
+            .await;
+    }
+
+    // Tests that an Arc<dyn DynInvoke> can be used where an Invoke is
+    // required, and that it calls the inner object exactly once (rather than
+    // recursing through the blanket DynInvoke impl).
+    #[tokio::test]
+    async fn arc_dyn_invoke_is_invoke() {
+        let inner = Arc::new(CountingInvoke(AtomicUsize::new(0)));
+        let arc: Arc<dyn DynInvoke> = inner.clone();
+        invoke_generic(&arc).await;
+        assert_eq!(inner.0.load(Ordering::Relaxed), 1);
+        // Method syntax goes through the blanket impl, but still reaches the
+        // inner object once.
+        let _ = arc
+            .dyn_invoke(RequestHeaders::default(), CallOptions::new())
+            .await;
+        assert_eq!(inner.0.load(Ordering::Relaxed), 2);
     }
 }
