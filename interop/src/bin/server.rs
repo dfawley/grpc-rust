@@ -31,7 +31,6 @@ use std::sync::Arc;
 use grpc::credentials::LocalServerCredentials;
 use grpc::credentials::ServerCredentials;
 use grpc::server::Http2Config;
-use grpc::server::Server as GrpcServer;
 use grpc_rustls::Identity as GrpcIdentity;
 use grpc_rustls::StaticProvider;
 use grpc_rustls::server::RustlsServerCredentials;
@@ -127,7 +126,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 server_protobuf::InteropTestService::default(),
             );
 
-            let server = GrpcServer::builder()
+            let server = grpc_tokio::server_builder()
                 .interceptor(server_protobuf::EchoHeaders::new())
                 .add_service(test_service)
                 .build();
@@ -144,7 +143,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 Arc::new(LocalServerCredentials::new())
             };
 
-            let listener = GrpcServer::tcp_listener(addr, creds, Http2Config::default()).await?;
+            let listener = grpc_tokio::tcp_listener(addr, creds, Http2Config::default()).await?;
             server.serve(listener).await?;
         }
     };

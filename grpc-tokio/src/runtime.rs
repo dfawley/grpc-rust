@@ -24,46 +24,50 @@
 
 use std::future::Future;
 use std::io;
-use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
+use grpc::__unstable::client::name_resolution::TCP_IP_NETWORK_TYPE;
+use grpc::__unstable::rt::BoxEndpoint;
+use grpc::__unstable::rt::BoxFuture;
+use grpc::__unstable::rt::BoxedTaskHandle;
+use grpc::__unstable::rt::DnsResolver;
+use grpc::__unstable::rt::EndpointListener;
+use grpc::__unstable::rt::GrpcEndpoint;
+use grpc::__unstable::rt::ResolverOptions;
+use grpc::__unstable::rt::Runtime;
+use grpc::__unstable::rt::Sleep;
+use grpc::__unstable::rt::StreamEndpoint;
+use grpc::__unstable::rt::TaskHandle;
+use grpc::__unstable::rt::TcpOptions;
+use grpc::__unstable::rt::UnixSocketOptions;
+use grpc::__unstable::rt::address::FailingSocketAddress;
+use grpc::__unstable::rt::address::ListenerAddress;
+use grpc::__unstable::rt::address::TcpAddress;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
-
-use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
-use crate::rt::BoxEndpoint;
-use crate::rt::BoxFuture;
-use crate::rt::BoxedTaskHandle;
-use crate::rt::DnsResolver;
-use crate::rt::ResolverOptions;
-use crate::rt::Runtime;
-use crate::rt::Sleep;
-use crate::rt::StreamEndpoint;
-use crate::rt::TaskHandle;
-use crate::rt::TcpOptions;
-use crate::rt::address::FailingSocketAddress;
-use crate::rt::address::ListenerAddress;
-use crate::rt::address::TcpAddress;
 
 #[cfg(feature = "dns")]
-mod hickory_resolver;
+use crate::hickory_resolver;
 #[cfg(unix)]
-mod unix;
+use crate::unix;
 
 /// A DNS resolver that uses tokio::net::lookup_host for resolution. It only
 /// supports host lookups.
-struct TokioDefaultDnsResolver {
+#[cfg(any(test, not(feature = "dns")))]
+pub(crate) struct TokioDefaultDnsResolver {
     _priv: (),
 }
 
-#[crate::async_trait]
+#[cfg(any(test, not(feature = "dns")))]
+#[grpc::async_trait]
 impl DnsResolver for TokioDefaultDnsResolver {
-    async fn lookup_host_name(&self, name: &str) -> Result<Vec<IpAddr>, String> {
-        let name_with_port = match name.parse::<IpAddr>() {
+    async fn lookup_host_name(&self, name: &str) -> Result<Vec<std::net::IpAddr>, String> {
+        let name_with_port = match name.parse::<std::net::IpAddr>() {
             Ok(ip) => SocketAddr::new(ip, 0).to_string(),
             Err(_) => format!("{name}:0"),
         };
@@ -80,22 +84,62 @@ impl DnsResolver for TokioDefaultDnsResolver {
     }
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct TokioRuntime {
-    _priv: (),
-}
-
-impl TaskHandle for JoinHandle<()> {
-    fn abort(&self) {
-        self.abort();
+#[cfg(any(test, not(feature = "dns")))]
+impl TokioDefaultDnsResolver {
+    pub(crate) fn new(opts: ResolverOptions) -> Result<Self, String> {
+        if opts.server_addr().is_some() {
+            return Err("Custom DNS server are not supported, enable optional feature 'dns' to enable support.".to_string());
+        }
+        Ok(TokioDefaultDnsResolver { _priv: () })
     }
 }
 
-impl Sleep for tokio::time::Sleep {}
+/// A gRPC [`Runtime`] backed by [Tokio](https://tokio.rs).
+///
+/// All operations must be performed from within the context of a Tokio
+/// runtime, which must have the IO and time drivers enabled.
+#[derive(Debug, Default)]
+pub struct TokioRuntime {
+    _priv: (),
+}
+
+impl TokioRuntime {
+    /// Creates a new `TokioRuntime`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Wraps a Tokio [`JoinHandle`] as a [`TaskHandle`].
+struct TokioTaskHandle(JoinHandle<()>);
+
+impl TaskHandle for TokioTaskHandle {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Wraps a Tokio [`Sleep`](tokio::time::Sleep) future as a [`Sleep`].
+    struct TokioSleep {
+        #[pin]
+        inner: tokio::time::Sleep,
+    }
+}
+
+impl Future for TokioSleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.project().inner.poll(cx)
+    }
+}
+
+impl Sleep for TokioSleep {}
 
 impl Runtime for TokioRuntime {
     fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> BoxedTaskHandle {
-        Box::new(tokio::spawn(task))
+        Box::new(TokioTaskHandle(tokio::spawn(task)))
     }
 
     fn get_dns_resolver(&self, opts: ResolverOptions) -> Result<Box<dyn DnsResolver>, String> {
@@ -111,7 +155,9 @@ impl Runtime for TokioRuntime {
 
     #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Sleep>> {
-        Box::pin(tokio::time::sleep(duration))
+        Box::pin(TokioSleep {
+            inner: tokio::time::sleep(duration),
+        })
     }
 
     #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
@@ -130,9 +176,9 @@ impl Runtime for TokioRuntime {
                 .await
                 .map_err(|err| err.to_string())?;
             stream
-                .set_nodelay(opts.enable_nodelay)
+                .set_nodelay(opts.enable_nodelay())
                 .map_err(|err| err.to_string())?;
-            if let Some(duration) = opts.keepalive {
+            if let Some(duration) = opts.keepalive() {
                 let sock_ref = socket2::SockRef::from(&stream);
                 let mut ka = socket2::TcpKeepalive::new();
                 ka = ka.with_time(duration);
@@ -140,8 +186,7 @@ impl Runtime for TokioRuntime {
                     .set_tcp_keepalive(&ka)
                     .map_err(|err| err.to_string())?;
             }
-            let stream: Box<dyn super::GrpcEndpoint> =
-                Box::new(StreamEndpoint::new_from_tcp(stream)?);
+            let stream: Box<dyn GrpcEndpoint> = Box::new(tcp_endpoint(stream)?);
             Ok(stream)
         })
     }
@@ -150,20 +195,20 @@ impl Runtime for TokioRuntime {
     fn unix_stream(
         &self,
         path: std::path::PathBuf,
-        _opts: super::UnixSocketOptions,
-    ) -> BoxFuture<Result<Box<dyn super::GrpcEndpoint>, String>> {
+        _opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn GrpcEndpoint>, String>> {
         Box::pin(unix::connect(path))
     }
 
     fn tcp_listener(
         &self,
         addr: SocketAddr,
-    ) -> BoxFuture<Result<Box<dyn super::EndpointListener>, String>> {
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
         Box::pin(async move {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(Box::new(TokioTcpListener { listener }) as Box<dyn super::EndpointListener>)
+            Ok(Box::new(TokioTcpListener { listener }) as Box<dyn EndpointListener>)
         })
     }
 
@@ -171,8 +216,8 @@ impl Runtime for TokioRuntime {
     fn unix_listener(
         &self,
         path: std::path::PathBuf,
-        _opts: super::UnixSocketOptions,
-    ) -> BoxFuture<Result<Box<dyn super::EndpointListener>, String>> {
+        _opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
         Box::pin(async move { unix::bind(path) })
     }
 
@@ -180,62 +225,55 @@ impl Runtime for TokioRuntime {
     fn unix_listener(
         &self,
         _path: std::path::PathBuf,
-        _opts: super::UnixSocketOptions,
-    ) -> BoxFuture<Result<Box<dyn super::EndpointListener>, String>> {
+        _opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
         Box::pin(
             async move { Err("Unix listeners are not supported on this platform".to_string()) },
         )
     }
 }
 
-impl TokioDefaultDnsResolver {
-    pub fn new(opts: ResolverOptions) -> Result<Self, String> {
-        if opts.server_addr.is_some() {
-            return Err("Custom DNS server are not supported, enable optional feature 'dns' to enable support.".to_string());
-        }
-        Ok(TokioDefaultDnsResolver { _priv: () })
-    }
+/// Creates an endpoint for a connected TCP stream.
+fn tcp_endpoint(stream: TcpStream) -> Result<StreamEndpoint<TcpStream>, String> {
+    let local_addr = stream
+        .local_addr()
+        .map_err(|err| err.to_string())?
+        .to_string()
+        .into_boxed_str();
+    let peer_addr = stream
+        .peer_addr()
+        .map_err(|err| err.to_string())?
+        .to_string()
+        .into_boxed_str();
+    Ok(StreamEndpoint::new(
+        stream,
+        local_addr,
+        peer_addr,
+        TCP_IP_NETWORK_TYPE,
+    ))
 }
 
-impl StreamEndpoint<TcpStream> {
-    pub(crate) fn new_from_tcp(stream: TcpStream) -> Result<Self, String> {
-        Ok(StreamEndpoint {
-            local_addr: stream
-                .local_addr()
-                .map_err(|err| err.to_string())?
-                .to_string()
-                .into_boxed_str(),
-            peer_addr: stream
-                .peer_addr()
-                .map_err(|err| err.to_string())?
-                .to_string()
-                .into_boxed_str(),
-            network_type: TCP_IP_NETWORK_TYPE,
-            inner: stream,
-        })
-    }
-
-    /// Creates an endpoint for a stream returned by `accept`, which also
-    /// returned `peer_addr`. Looking the peer address up again could fail if
-    /// the client has already reset the connection. If the local address can't
-    /// be read, it is left empty.
-    fn new_from_accepted_tcp(stream: TcpStream, peer_addr: SocketAddr) -> Self {
-        StreamEndpoint {
-            local_addr: stream
-                .local_addr()
-                .map(|addr| addr.to_string())
-                .unwrap_or_default()
-                .into_boxed_str(),
-            peer_addr: peer_addr.to_string().into_boxed_str(),
-            network_type: TCP_IP_NETWORK_TYPE,
-            inner: stream,
-        }
-    }
+/// Creates an endpoint for a stream returned by `accept`, which also returned
+/// `peer_addr`. Looking the peer address up again could fail if the client has
+/// already reset the connection. If the local address can't be read, it is left
+/// empty.
+fn accepted_tcp_endpoint(stream: TcpStream, peer_addr: SocketAddr) -> StreamEndpoint<TcpStream> {
+    let local_addr = stream
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_default()
+        .into_boxed_str();
+    StreamEndpoint::new(
+        stream,
+        local_addr,
+        peer_addr.to_string().into_boxed_str(),
+        TCP_IP_NETWORK_TYPE,
+    )
 }
 
 /// How [`accept_with_retry`] backs off after accept failures that aren't
 /// per-connection.
-struct AcceptRetryPolicy {
+pub(crate) struct AcceptRetryPolicy {
     /// Delay after the first such failure.
     initial_backoff: Duration,
     /// Upper bound on the delay between retries.
@@ -243,7 +281,7 @@ struct AcceptRetryPolicy {
 }
 
 /// Policy used by the tokio TCP and Unix listeners.
-const TOKIO_ACCEPT_RETRY_POLICY: AcceptRetryPolicy = AcceptRetryPolicy {
+pub(crate) const TOKIO_ACCEPT_RETRY_POLICY: AcceptRetryPolicy = AcceptRetryPolicy {
     initial_backoff: Duration::from_millis(5),
     max_backoff: Duration::from_secs(1),
 };
@@ -269,7 +307,7 @@ fn is_connection_error(err: &io::Error) -> bool {
 // TODO: Every accept error is retried, because there's no simple cross-platform way
 // to tell retryable errors from permanent ones. Following other Rust servers is our
 // best guess for now.
-async fn accept_with_retry<T, F, Fut>(policy: &AcceptRetryPolicy, mut accept: F) -> T
+pub(crate) async fn accept_with_retry<T, F, Fut>(policy: &AcceptRetryPolicy, mut accept: F) -> T
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = io::Result<T>>,
@@ -287,24 +325,22 @@ where
             continue;
         }
         #[allow(clippy::disallowed_methods)] // This is Tokio's runtime implementation.
-        sleep(backoff).await;
+        tokio::time::sleep(backoff).await;
         backoff = backoff.saturating_mul(2).min(policy.max_backoff);
     }
 }
 
-/// Wraps `tokio::net::TcpListener` as an [`EndpointListener`](super::EndpointListener).
+/// Wraps `tokio::net::TcpListener` as an [`EndpointListener`](EndpointListener).
 struct TokioTcpListener {
     listener: tokio::net::TcpListener,
 }
 
-#[crate::async_trait]
-impl super::EndpointListener for TokioTcpListener {
-    async fn accept(&self) -> Result<Box<dyn super::GrpcEndpoint>, String> {
+#[grpc::async_trait]
+impl EndpointListener for TokioTcpListener {
+    async fn accept(&self) -> Result<Box<dyn GrpcEndpoint>, String> {
         let (stream, peer_addr) =
             accept_with_retry(&TOKIO_ACCEPT_RETRY_POLICY, || self.listener.accept()).await;
-        Ok(Box::new(StreamEndpoint::new_from_accepted_tcp(
-            stream, peer_addr,
-        )))
+        Ok(Box::new(accepted_tcp_endpoint(stream, peer_addr)))
     }
 
     fn local_addr(&self) -> Box<dyn ListenerAddress> {
@@ -441,9 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_resolver_custom_authority() {
-        let opts = ResolverOptions {
-            server_addr: Some("8.8.8.8:53".parse().unwrap()),
-        };
+        let opts = ResolverOptions::default().with_server_addr(Some("8.8.8.8:53".parse().unwrap()));
         let default_resolver = TokioDefaultDnsResolver::new(opts);
         assert!(default_resolver.is_err());
     }

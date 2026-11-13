@@ -233,7 +233,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::rt::GrpcRuntime;
+    use crate::rt::default_runtime;
 
     #[derive(Debug, PartialEq, Eq, Clone)]
     struct UserId(usize);
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn clone_preserves_deadline() {
-        let deadline = GrpcRuntime::default().now() + Duration::from_secs(10);
+        let deadline = default_runtime().now() + Duration::from_secs(10);
         let mut opts = CallOptions::new();
         opts.set_deadline(deadline);
         opts.set_option(UserId(1));

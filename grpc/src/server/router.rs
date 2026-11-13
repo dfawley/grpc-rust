@@ -117,7 +117,7 @@ impl Default for RouterBuilder<Identity> {
 ///
 /// `Router` implements [`Handle`], so it can be used as the handler for a
 /// [`Server`](crate::server::Server). For most use cases, prefer
-/// [`Server::builder()`](crate::server::Server::builder) which constructs
+/// [`Server::builder(default_runtime())`](crate::server::Server::builder) which constructs
 /// both the router and server together.
 ///
 /// A `Router` is immutable once built; use [`RouterBuilder`] to construct one.

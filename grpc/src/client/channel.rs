@@ -88,7 +88,6 @@ use crate::client::subchannel::NopBackoff;
 use crate::client::transport::GLOBAL_TRANSPORT_REGISTRY;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportRegistry;
-#[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
 use crate::core::Address;
 use crate::core::RecvMessage;
@@ -99,8 +98,6 @@ use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
 use crate::rt;
 use crate::rt::GrpcRuntime;
-#[cfg(feature = "_runtime-tokio")]
-use crate::rt::default_runtime;
 
 /// A virtual, persistent connection to a gRPC service.
 ///
@@ -120,8 +117,8 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Creates a new channel builder for the given target. Target and
-    /// credentials are required to build a channel.
+    /// Creates a new channel builder for the given target, credentials, and
+    /// runtime. All three are required to build a channel.
     ///
     /// The [target name](https://github.com/grpc/grpc/blob/master/doc/naming.md)
     /// is a fully qualified, self contained URI defined by [rfc3986](https://datatracker.ietf.org/doc/html/rfc3986).
@@ -140,6 +137,10 @@ impl Channel {
     ///
     /// Credentials must implement the [`ChannelCredentials`] trait.
     ///
+    /// The runtime is used for all I/O, timers, and background tasks. Runtime
+    /// implementations are provided by separate crates, e.g. `grpc-tokio`,
+    /// which also provides a `channel_builder()` function that uses the Tokio
+    /// runtime.
     ///
     ///# Example
     ///
@@ -148,24 +149,14 @@ impl Channel {
     /// use grpc::client::Channel;
     /// use grpc::credentials::LocalChannelCredentials;
     ///
-    /// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
-    ///     .build();
+    /// let channel = Channel::builder(
+    ///     "dns:///localhost:123",
+    ///     Arc::new(LocalChannelCredentials::new()),
+    ///     grpc_tokio::runtime(),
+    /// )
+    /// .build();
     /// ```
-    #[cfg(feature = "_runtime-tokio")]
     pub fn builder(
-        target: impl Into<String>,
-        credentials: Arc<dyn ChannelCredentials>,
-    ) -> ChannelBuilder {
-        Self::builder_with_runtime(target, credentials, default_runtime())
-    }
-
-    /// Creates a new channel builder for the given target, credentials, and
-    /// runtime.
-    ///
-    /// Always available. When the `_runtime-tokio` feature is enabled,
-    /// [`builder()`](Channel::builder) can be used instead to use the default
-    /// Tokio runtime.
-    pub(crate) fn builder_with_runtime(
         target: impl Into<String>,
         credentials: Arc<dyn ChannelCredentials>,
         runtime: GrpcRuntime,
@@ -257,8 +248,12 @@ impl ChannelBuilder {
     /// use grpc::client::Channel;
     /// use grpc::credentials::LocalChannelCredentials;
     ///
-    /// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
-    ///     .build();
+    /// let channel = Channel::builder(
+    ///     "dns:///localhost:123",
+    ///     Arc::new(LocalChannelCredentials::new()),
+    ///     grpc_tokio::runtime(),
+    /// )
+    /// .build();
     /// ```
     pub fn build(self) -> Channel {
         // TODO(nathanielford) This construction is currently a rough-cut placeholder.
@@ -869,7 +864,6 @@ fn setup_registeries() {
     name_resolution::unix::reg();
     #[cfg(target_os = "linux")]
     name_resolution::unix_abstract::reg();
-    #[cfg(feature = "_runtime-tokio")]
     tonic_transport::reg();
 }
 
@@ -880,11 +874,13 @@ mod tests {
 
     use super::*;
     use crate::credentials::LocalChannelCredentials;
+    use crate::rt::default_runtime;
 
     fn new_channel() -> Channel {
         Channel::builder(
             "dns:///localhost:1234",
             Arc::new(LocalChannelCredentials::new()),
+            default_runtime(),
         )
         .build()
     }
@@ -935,7 +931,7 @@ mod tests {
     async fn assert_next<'a, T: 'a>(
         next: impl Future<Output = Snapshot<'a, T>>,
     ) -> Snapshot<'a, T> {
-        GrpcRuntime::default()
+        default_runtime()
             .timeout(Duration::from_secs(5), next)
             .await
             .expect("next() did not resolve")
@@ -944,7 +940,7 @@ mod tests {
     // Fails the test if next() resolves without a further update.
     async fn assert_no_next<'a, T: 'a>(next: impl Future<Output = Snapshot<'a, T>>) {
         assert!(
-            GrpcRuntime::default()
+            default_runtime()
                 .timeout(Duration::from_millis(10), next)
                 .await
                 .is_err(),

@@ -33,7 +33,6 @@ use std::sync::Arc;
 
 use generated::api::ListTopicsRequest;
 use generated::api::publisher_client::PublisherClient;
-use grpc::client::Channel;
 use grpc::credentials::CompositeChannelCredentials;
 use grpc_google_cloud_auth::GcpCallCredentials;
 use grpc_rustls::client::ClientTlsConfig;
@@ -53,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls = RustlsChannelCredentials::new(ClientTlsConfig::new())?;
     let channel_creds = CompositeChannelCredentials::new(tls, Arc::new(call_creds));
 
-    let channel = Channel::builder(ENDPOINT, Arc::new(channel_creds)).build();
+    let channel = grpc_tokio::channel_builder(ENDPOINT, Arc::new(channel_creds)).build();
 
     let client = PublisherClient::new(channel);
 

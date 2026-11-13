@@ -182,6 +182,7 @@ mod tests {
     use crate::private;
     use crate::rt::BoxEndpoint;
     use crate::rt::GrpcRuntime;
+    use crate::rt::default_runtime;
     use crate::stub_server::RunningStubServer;
     use crate::stub_server::StubServer;
 
@@ -351,7 +352,7 @@ mod tests {
             let (result_tx, result_rx) = oneshot::channel();
             self.update_tx.send((update, result_tx)).unwrap();
             self.work_scheduler.schedule_work();
-            GrpcRuntime::default()
+            default_runtime()
                 .timeout(DEFAULT_TEST_TIMEOUT, result_rx)
                 .await
                 .expect("timed out waiting for the channel to apply the update")
@@ -441,10 +442,15 @@ mod tests {
         let server = StubServer::new().start().await;
         let addr = server.addr();
         let (scheme, mut handle_rx) = FakeResolverBuilder::register();
-        let mut channel = Channel::builder(format!("{scheme}:///{addr}"), credentials).build();
+        let mut channel = Channel::builder(
+            format!("{scheme}:///{addr}"),
+            credentials,
+            default_runtime(),
+        )
+        .build();
         // Exit idle so the channel builds its resolver.
         channel.get_state(true);
-        let resolver = GrpcRuntime::default()
+        let resolver = default_runtime()
             .timeout(DEFAULT_TEST_TIMEOUT, handle_rx.recv())
             .await
             .expect("timed out waiting for the channel to build its resolver")
@@ -474,7 +480,7 @@ mod tests {
     /// the RPC stays in progress until it's passed to [`finish_unary_echo`].
     async fn start_unary_echo(channel: &Channel) -> UnaryEchoRpc {
         let headers = RequestHeaders::new().with_method_name(UNARY_ECHO_METHOD);
-        GrpcRuntime::default()
+        default_runtime()
             .timeout(
                 DEFAULT_TEST_TIMEOUT,
                 channel.invoke(headers, CallOptions::default()),
@@ -492,7 +498,7 @@ mod tests {
     ) -> JoinHandle<UnaryEchoRpc> {
         let channel = channel.clone();
         let rpc_handle = tokio::spawn(async move { start_unary_echo(&channel).await });
-        GrpcRuntime::default()
+        default_runtime()
             .timeout(DEFAULT_TEST_TIMEOUT, interceptions.recv())
             .await
             .expect("timed out waiting for the RPC to reach its interceptor")
@@ -538,7 +544,7 @@ mod tests {
                 }
             }
         };
-        GrpcRuntime::default()
+        default_runtime()
             .timeout(DEFAULT_TEST_TIMEOUT, finish)
             .await
             .expect("timed out waiting for the RPC to end")
@@ -601,7 +607,7 @@ mod tests {
         let mut rpc = tokio::spawn(async move { unary_echo(&rpc_channel, "hello").await });
 
         assert!(
-            GrpcRuntime::default()
+            default_runtime()
                 .timeout(DEFAULT_TEST_SHORT_TIMEOUT, &mut rpc)
                 .await
                 .is_err(),

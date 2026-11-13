@@ -31,7 +31,6 @@ use std::sync::Arc;
 
 use bytes::Buf;
 use bytes::Bytes;
-use grpc::__unstable::client::channel_builder_with_runtime;
 use grpc::__unstable::rt::GrpcRuntime;
 use grpc::client::CallOptions;
 use grpc::client::Channel;
@@ -92,7 +91,7 @@ impl TransportBuilder for GrpcTransportBuilder {
     type Transport = GrpcTransport;
 
     async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
-        let channel = channel_builder_with_runtime(
+        let channel = grpc::client::Channel::builder(
             server.uri(),
             self.credentials.clone(),
             self.runtime.clone(),
@@ -249,7 +248,7 @@ mod tests {
 
         let addr = running_cp.addr();
         let server_config = ServerConfig::new(format!("dns:///{addr}"));
-        let transport = GrpcTransportBuilder::new(GrpcRuntime::default())
+        let transport = GrpcTransportBuilder::new(grpc_tokio::runtime())
             .build(&server_config)
             .await
             .expect("build transport");
@@ -293,9 +292,9 @@ mod tests {
         );
         let client = XdsClient::builder(
             config,
-            GrpcTransportBuilder::new(GrpcRuntime::default()),
+            GrpcTransportBuilder::new(grpc_tokio::runtime()),
             ProstCodec,
-            XdsRuntime::new(GrpcRuntime::default()),
+            XdsRuntime::new(grpc_tokio::runtime()),
         )
         .build();
 

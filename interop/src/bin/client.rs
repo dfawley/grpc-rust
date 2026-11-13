@@ -186,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     RustlsChannelCredentials::new(GrpcClientTlsConfig::new())?
                 };
-                let mut builder = grpc::client::Channel::builder(&target, Arc::new(creds));
+                let mut builder = grpc_tokio::channel_builder(&target, Arc::new(creds));
                 let authority = matches
                     .server_host_override
                     .as_deref()
@@ -196,10 +196,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 builder.build()
             } else {
-                let mut builder = grpc::client::Channel::builder(
-                    &target,
-                    Arc::new(LocalChannelCredentials::new()),
-                );
+                let mut builder =
+                    grpc_tokio::channel_builder(&target, Arc::new(LocalChannelCredentials::new()));
                 if let Some(authority) = &matches.server_host_override {
                     builder = builder.authority(authority);
                 }
