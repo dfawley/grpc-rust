@@ -116,7 +116,7 @@ mod tests {
         let server_addr = listener.local_addr().unwrap();
         let authority = Authority::new("example.com", Some(server_addr.port()));
 
-        let runtime = rt::default_runtime();
+        let runtime = grpc_tokio::runtime();
         let endpoint = runtime
             .tcp_stream(server_addr, TcpOptions::default())
             .await

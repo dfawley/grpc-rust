@@ -36,6 +36,7 @@ use generated::helloworld::HelloRequest;
 use generated::helloworld::greeter_client::GreeterClient;
 use grpc::client::Channel;
 use grpc::credentials::LocalChannelCredentials;
+use grpc_tokio::ChannelExt as _;
 use protobuf::proto;
 
 #[tokio::main]

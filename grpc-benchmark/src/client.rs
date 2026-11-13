@@ -35,6 +35,7 @@ use grpc_rustls::RootCertificates;
 use grpc_rustls::StaticRootCertificatesProvider;
 use grpc_rustls::client::ClientTlsConfig;
 use grpc_rustls::client::RustlsChannelCredentials;
+use grpc_tokio::ChannelExt as _;
 use hdrhistogram::Histogram;
 use protobuf::proto;
 use tokio::sync::mpsc;

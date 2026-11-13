@@ -59,18 +59,18 @@ impl ListenerAddress for TcpAddress {
 
 /// Address for a Unix socket listener.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct UnixListenerAddress {
+pub struct UnixListenerAddress {
     path: String,
 }
 
 impl UnixListenerAddress {
     /// Creates a new Unix listener address.
-    pub(crate) fn new(path: String) -> Self {
+    pub fn new(path: String) -> Self {
         Self { path }
     }
 
     /// Returns the socket path.
-    pub(crate) fn path(&self) -> &str {
+    pub fn path(&self) -> &str {
         &self.path
     }
 }

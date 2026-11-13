@@ -38,6 +38,7 @@ use grpc::credentials::CompositeChannelCredentials;
 use grpc_google_cloud_auth::GcpCallCredentials;
 use grpc_rustls::client::ClientTlsConfig;
 use grpc_rustls::client::RustlsChannelCredentials;
+use grpc_tokio::ChannelExt as _;
 use protobuf::proto;
 
 const ENDPOINT: &str = "dns:///pubsub.googleapis.com";

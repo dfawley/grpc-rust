@@ -207,8 +207,12 @@ where
 /// use grpc::client::interceptor::InvokeExt;
 ///
 /// // Create a channel:
-/// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
-///     .build();
+/// let channel = Channel::builder_with_runtime(
+///     "dns:///localhost:123",
+///     Arc::new(LocalChannelCredentials::new()),
+///     grpc_tokio::runtime(),
+/// )
+/// .build();
 ///
 /// // Create an interceptor:
 /// let interceptor = ResponseValidator::new(true);
@@ -251,8 +255,12 @@ pub trait InvokeExt: Invoke + Sized {
 /// use grpc::client::interceptor::InvokeOnceExt;
 ///
 /// // Create a channel:
-/// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
-///     .build();
+/// let channel = Channel::builder_with_runtime(
+///     "dns:///localhost:123",
+///     Arc::new(LocalChannelCredentials::new()),
+///     grpc_tokio::runtime(),
+/// )
+/// .build();
 /// // Create an interceptor:
 /// let interceptor = ResponseValidator::new(true);
 ///

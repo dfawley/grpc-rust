@@ -60,6 +60,7 @@ use grpc_rustls::RootCertificates;
 use grpc_rustls::StaticProvider;
 use grpc_rustls::client::ClientTlsConfig;
 use grpc_rustls::client::RustlsChannelCredentials;
+use grpc_tokio::ChannelExt as _;
 use prost::Message as _;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;

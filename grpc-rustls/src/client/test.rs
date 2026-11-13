@@ -48,7 +48,6 @@ use crate::client::RustlsChannelCredentials;
 use grpc::__unstable::UnstableToken;
 use grpc::__unstable::credentials::client::ClientHandshakeInfo;
 use grpc::__unstable::credentials::common::Authority;
-use grpc::__unstable::rt;
 use grpc::__unstable::rt::EndpointIoStream;
 use grpc::__unstable::rt::TcpOptions;
 use grpc::credentials::ChannelCredentials;
@@ -162,7 +161,7 @@ async fn test_tls_key_log() {
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let endpoint = runtime
         .tcp_stream(addr, TcpOptions::default())
         .await
@@ -212,7 +211,7 @@ async fn test_tls_handshake_wrong_server_name() {
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let endpoint = runtime
         .tcp_stream(addr, TcpOptions::default())
         .await
@@ -269,7 +268,7 @@ async fn test_tls_validate_authority() {
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let endpoint = runtime
         .tcp_stream(addr, TcpOptions::default())
         .await
@@ -312,7 +311,7 @@ async fn test_mtls_handshake_no_identity() {
         .with_root_certificates_provider(StaticProvider::new(load_root_certs("ca.pem")));
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let endpoint = runtime
         .tcp_stream(addr, TcpOptions::default())
         .await
@@ -367,7 +366,7 @@ async fn test_mtls_handshake_with_identitiy() {
         .with_identity_provider(identity_provider);
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let endpoint = runtime
         .tcp_stream(addr, TcpOptions::default())
         .await
@@ -424,7 +423,7 @@ async fn check_client_resumption_disabled(
     let creds = RustlsChannelCredentials::new(config).unwrap();
 
     for i in 0..2 {
-        let runtime = rt::default_runtime();
+        let runtime = grpc_tokio::runtime();
         let endpoint = runtime
             .tcp_stream(addr, TcpOptions::default())
             .await
@@ -587,7 +586,7 @@ async fn run_handshake_test(server_alpn: Vec<Vec<u8>>, expect_success: bool) {
 
     let creds = RustlsChannelCredentials::new(config).unwrap();
 
-    let runtime = rt::default_runtime();
+    let runtime = grpc_tokio::runtime();
     let endpoint = runtime
         .tcp_stream(addr, TcpOptions::default())
         .await

@@ -88,7 +88,6 @@ use crate::client::subchannel::NopBackoff;
 use crate::client::transport::GLOBAL_TRANSPORT_REGISTRY;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportRegistry;
-#[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
 use crate::core::Address;
 use crate::core::RecvMessage;
@@ -99,8 +98,6 @@ use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
 use crate::rt;
 use crate::rt::GrpcRuntime;
-#[cfg(feature = "_runtime-tokio")]
-use crate::rt::default_runtime;
 
 /// A virtual, persistent connection to a gRPC service.
 ///
@@ -120,8 +117,8 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Creates a new channel builder for the given target. Target and
-    /// credentials are required to build a channel.
+    /// Creates a new channel builder for the given target, credentials, and
+    /// runtime. All three are required to build a channel.
     ///
     /// The [target name](https://github.com/grpc/grpc/blob/master/doc/naming.md)
     /// is a fully qualified, self contained URI defined by [rfc3986](https://datatracker.ietf.org/doc/html/rfc3986).
@@ -140,6 +137,10 @@ impl Channel {
     ///
     /// Credentials must implement the [`ChannelCredentials`] trait.
     ///
+    /// The runtime is used for all I/O, timers, and background tasks. Runtime
+    /// implementations are provided by separate crates, e.g. `grpc-tokio`,
+    /// which also provides a `Channel::builder` extension that uses the Tokio
+    /// runtime.
     ///
     ///# Example
     ///
@@ -148,24 +149,14 @@ impl Channel {
     /// use grpc::client::Channel;
     /// use grpc::credentials::LocalChannelCredentials;
     ///
-    /// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
-    ///     .build();
+    /// let channel = Channel::builder_with_runtime(
+    ///     "dns:///localhost:123",
+    ///     Arc::new(LocalChannelCredentials::new()),
+    ///     grpc_tokio::runtime(),
+    /// )
+    /// .build();
     /// ```
-    #[cfg(feature = "_runtime-tokio")]
-    pub fn builder(
-        target: impl Into<String>,
-        credentials: Arc<dyn ChannelCredentials>,
-    ) -> ChannelBuilder {
-        Self::builder_with_runtime(target, credentials, default_runtime())
-    }
-
-    /// Creates a new channel builder for the given target, credentials, and
-    /// runtime.
-    ///
-    /// Always available. When the `_runtime-tokio` feature is enabled,
-    /// [`builder()`](Channel::builder) can be used instead to use the default
-    /// Tokio runtime.
-    pub(crate) fn builder_with_runtime(
+    pub fn builder_with_runtime(
         target: impl Into<String>,
         credentials: Arc<dyn ChannelCredentials>,
         runtime: GrpcRuntime,
@@ -176,6 +167,15 @@ impl Channel {
             authority: None,
             runtime,
         }
+    }
+
+    /// Creates a new channel builder that uses the unit test runtime.
+    #[cfg(test)]
+    pub(crate) fn builder(
+        target: impl Into<String>,
+        credentials: Arc<dyn ChannelCredentials>,
+    ) -> ChannelBuilder {
+        Self::builder_with_runtime(target, credentials, crate::rt::default_runtime())
     }
 
     /// Returns the current state of the channel. If `connect` is true and the
@@ -257,8 +257,12 @@ impl ChannelBuilder {
     /// use grpc::client::Channel;
     /// use grpc::credentials::LocalChannelCredentials;
     ///
-    /// let channel = Channel::builder("dns:///localhost:123", Arc::new(LocalChannelCredentials::new()))
-    ///     .build();
+    /// let channel = Channel::builder_with_runtime(
+    ///     "dns:///localhost:123",
+    ///     Arc::new(LocalChannelCredentials::new()),
+    ///     grpc_tokio::runtime(),
+    /// )
+    /// .build();
     /// ```
     pub fn build(self) -> Channel {
         // TODO(nathanielford) This construction is currently a rough-cut placeholder.
@@ -869,7 +873,6 @@ fn setup_registeries() {
     name_resolution::unix::reg();
     #[cfg(target_os = "linux")]
     name_resolution::unix_abstract::reg();
-    #[cfg(feature = "_runtime-tokio")]
     tonic_transport::reg();
 }
 

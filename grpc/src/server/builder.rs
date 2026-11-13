@@ -34,7 +34,7 @@ use crate::server::service::Service;
 ///
 /// Register services with [`add_service()`](ServerBuilder::add_service) and add
 /// global interceptors with [`interceptor()`](ServerBuilder::interceptor), then
-/// finish with [`build()`](ServerBuilder::build).
+/// finish with [`build_with_runtime()`](ServerBuilder::build_with_runtime).
 pub struct ServerBuilder<I = Identity> {
     router: RouterBuilder<I>,
 }
@@ -75,28 +75,19 @@ impl<I: Intercept + Clone + Send + Sync + 'static> ServerBuilder<I> {
         self
     }
 
-    /// Builds the [`Server`] with the explicitly provided runtime.
+    /// Builds the [`Server`] with the provided runtime.
     ///
-    /// Always available. When the `_runtime-tokio` feature is enabled,
-    /// [`build()`](ServerBuilder::build) can be used instead to use the default
+    /// Runtime implementations are provided by separate crates, e.g.
+    /// `grpc-tokio`, which also provides a `build()` extension that uses the
     /// Tokio runtime.
     pub fn build_with_runtime(self, runtime: GrpcRuntime) -> Server {
         Server::new(self.router.build(), runtime)
     }
-}
 
-// ---------------------------------------------------------------------------
-// build() — uses the default runtime when _runtime-tokio is enabled
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "_runtime-tokio")]
-impl<I: Intercept + Clone + Send + Sync + 'static> ServerBuilder<I> {
-    /// Builds the [`Server`] using the default Tokio runtime.
-    ///
-    /// Available only when the `_runtime-tokio` feature is enabled. Without it,
-    /// use [`build_with_runtime()`](ServerBuilder::build_with_runtime).
-    pub fn build(self) -> Server {
-        Server::new(self.router.build(), crate::rt::default_runtime())
+    /// Builds the [`Server`] with the unit test runtime.
+    #[cfg(test)]
+    pub(crate) fn build(self) -> Server {
+        self.build_with_runtime(crate::rt::default_runtime())
     }
 }
 

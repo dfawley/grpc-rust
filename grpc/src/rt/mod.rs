@@ -43,7 +43,10 @@ use crate::private;
 
 pub mod address;
 pub(crate) mod hyper_wrapper;
-#[cfg(feature = "_runtime-tokio")]
+/// A minimal Tokio-based runtime used by this crate's unit tests. The real
+/// Tokio runtime lives in the `grpc-tokio` crate, which can't be used here
+/// because it depends on this crate.
+#[cfg(test)]
 pub(crate) mod tokio;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -52,7 +55,7 @@ pub type BoxEndpoint = Box<dyn GrpcEndpoint>;
 
 /// A server-side listening socket that yields incoming connections.
 #[crate::async_trait]
-pub(crate) trait EndpointListener: Send + Sync + 'static {
+pub trait EndpointListener: Send + Sync + 'static {
     /// Accepts the next incoming connection.
     ///
     /// An error stops the server, so return one only when the listener itself
@@ -107,16 +110,12 @@ pub trait Runtime: Send + Sync + Debug {
     }
 
     /// Binds a TCP listener to the given address.
-    #[doc(hidden)]
-    #[allow(private_interfaces)]
     fn tcp_listener(
         &self,
         addr: SocketAddr,
     ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>>;
 
     /// Binds a Unix listener to the given path.
-    #[doc(hidden)]
-    #[allow(private_interfaces)]
     fn unix_listener(
         &self,
         path: PathBuf,
@@ -149,10 +148,38 @@ pub struct ResolverOptions {
     pub(super) server_addr: Option<std::net::SocketAddr>,
 }
 
+impl ResolverOptions {
+    /// Sets the address of the DNS server to use. If `None`, the system's
+    /// default DNS server will be used.
+    pub fn with_server_addr(mut self, server_addr: Option<std::net::SocketAddr>) -> Self {
+        self.server_addr = server_addr;
+        self
+    }
+
+    /// Returns the address of the DNS server to use, or `None` if the system's
+    /// default DNS server should be used.
+    pub fn server_addr(&self) -> Option<std::net::SocketAddr> {
+        self.server_addr
+    }
+}
+
 #[derive(Default)]
 pub struct TcpOptions {
     pub(crate) enable_nodelay: bool,
     pub(crate) keepalive: Option<Duration>,
+}
+
+impl TcpOptions {
+    /// Returns whether `TCP_NODELAY` should be set on the socket.
+    pub fn enable_nodelay(&self) -> bool {
+        self.enable_nodelay
+    }
+
+    /// Returns the TCP keepalive idle time to configure on the socket, or
+    /// `None` if TCP keepalives should not be enabled.
+    pub fn keepalive(&self) -> Option<Duration> {
+        self.keepalive
+    }
 }
 
 #[derive(Default)]
@@ -418,62 +445,10 @@ impl GrpcEndpoint for Box<dyn GrpcEndpoint> {
     }
 }
 
-/// A fake runtime to satisfy the compiler when no runtime is enabled. This will
-///
-/// # Panics
-///
-/// Panics if any of its functions are called.
-#[derive(Default, Debug)]
-pub(crate) struct NoOpRuntime {}
-
-impl Runtime for NoOpRuntime {
-    fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> BoxedTaskHandle {
-        unimplemented!()
-    }
-
-    fn get_dns_resolver(&self, opts: ResolverOptions) -> Result<Box<dyn DnsResolver>, String> {
-        unimplemented!()
-    }
-
-    fn sleep(&self, duration: std::time::Duration) -> Pin<Box<dyn Sleep>> {
-        unimplemented!()
-    }
-
-    fn now(&self) -> Instant {
-        unimplemented!()
-    }
-
-    fn tcp_stream(
-        &self,
-        _target: SocketAddr,
-        _opts: TcpOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn GrpcEndpoint>, String>> + Send>> {
-        unimplemented!()
-    }
-
-    fn tcp_listener(
-        &self,
-        _addr: SocketAddr,
-    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
-        unimplemented!()
-    }
-
-    fn unix_listener(
-        &self,
-        _path: PathBuf,
-        _opts: UnixSocketOptions,
-    ) -> BoxFuture<Result<Box<dyn EndpointListener>, String>> {
-        unimplemented!()
-    }
-}
-
-pub fn default_runtime() -> GrpcRuntime {
-    #[cfg(feature = "_runtime-tokio")]
-    {
-        return GrpcRuntime::new(tokio::TokioRuntime::default());
-    }
-    #[allow(unreachable_code)]
-    GrpcRuntime::new(NoOpRuntime::default())
+/// Returns the runtime used by this crate's unit tests.
+#[cfg(test)]
+pub(crate) fn default_runtime() -> GrpcRuntime {
+    GrpcRuntime::new(tokio::TokioRuntime::default())
 }
 
 #[derive(Clone, Debug)]
@@ -486,6 +461,7 @@ pub struct GrpcRuntime {
 #[derive(Debug)]
 pub(crate) struct Elapsed;
 
+#[cfg(test)]
 impl Default for GrpcRuntime {
     fn default() -> Self {
         default_runtime()

@@ -37,6 +37,7 @@ use std::sync::Arc;
 use grpc::client::Channel;
 use grpc::client::Invoke;
 use grpc::credentials::LocalChannelCredentials;
+use grpc_tokio::ChannelExt as _;
 use tokio::task;
 
 use crate::generated::routeguide::Feature;

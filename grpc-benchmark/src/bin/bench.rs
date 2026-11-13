@@ -47,6 +47,7 @@ use grpc_benchmark::generated::grpc::testing::SimpleProtoParams;
 use grpc_benchmark::generated::grpc::testing::worker_service_client::WorkerServiceClient;
 use grpc_benchmark::generated::services::grpc::testing::worker_service_server::WorkerServiceServer;
 use grpc_benchmark::worker::WorkerServer;
+use grpc_tokio::ChannelExt as _;
 use pico_args::Arguments;
 use protobuf::proto;
 use tokio::sync::Notify;

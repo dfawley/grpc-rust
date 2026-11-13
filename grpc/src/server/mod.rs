@@ -111,7 +111,6 @@ pub trait GracefulConnection: Future<Output = Result<(), String>> + Send + 'stat
     fn graceful_shutdown(self: Pin<&mut Self>, token: SealedToken);
 }
 
-#[derive(Default)]
 pub struct Server {
     handler: Option<Arc<dyn DynHandle>>,
     runtime: GrpcRuntime,
@@ -219,21 +218,21 @@ impl Server {
         ServerBuilder::new()
     }
 
-    /// Binds a TCP listener to `addr` with the given server credentials and HTTP/2 configuration.
+    /// Binds a TCP listener to `addr` using the given runtime, server
+    /// credentials, and HTTP/2 configuration.
+    ///
+    /// The runtime should generally be the same one passed to
+    /// [`ServerBuilder::build_with_runtime`].
     // TODO: Consider making this a builder to allow adding additional listener
     // configuration without breaking changes.
-    #[cfg(feature = "_runtime-tokio")]
-    pub async fn tcp_listener(
+    pub async fn tcp_listener_with_runtime(
         addr: std::net::SocketAddr,
         creds: Arc<dyn crate::credentials::ServerCredentials>,
         config: Http2Config,
+        runtime: GrpcRuntime,
     ) -> Result<impl Listener, String> {
-        let listener = transport::hyper::HyperListener::new_tcp_listener(
-            addr,
-            creds,
-            &crate::rt::default_runtime(),
-        )
-        .await?;
+        let listener =
+            transport::hyper::HyperListener::new_tcp_listener(addr, creds, &runtime).await?;
         Ok(listener.with_config(config))
     }
 
@@ -1273,9 +1272,14 @@ mod tests {
         let creds: Arc<dyn ServerCredentials> = Arc::new(LocalServerCredentials::new());
         let config = Http2Config::new().with_max_recv_message_size(1024);
 
-        let listener = Server::tcp_listener("127.0.0.1:0".parse().unwrap(), creds, config)
-            .await
-            .unwrap();
+        let listener = Server::tcp_listener_with_runtime(
+            "127.0.0.1:0".parse().unwrap(),
+            creds,
+            config,
+            GrpcRuntime::default(),
+        )
+        .await
+        .unwrap();
 
         let local_addr = listener.local_addr();
         let tcp_addr = (&*local_addr as &dyn Any)

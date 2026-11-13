@@ -36,6 +36,8 @@ use grpc_rustls::Identity as GrpcIdentity;
 use grpc_rustls::StaticProvider;
 use grpc_rustls::server::RustlsServerCredentials;
 use grpc_rustls::server::ServerTlsConfig as GrpcServerTlsConfig;
+use grpc_tokio::ServerBuilderExt as _;
+use grpc_tokio::ServerExt as _;
 use interop::server_prost;
 use interop::server_protobuf;
 use tonic::transport::Identity as TonicIdentity;
