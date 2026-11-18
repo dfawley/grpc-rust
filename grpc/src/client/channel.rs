@@ -572,8 +572,8 @@ struct ResolverChannelController {
     lb_work_scheduler: Arc<LbWorkScheduler>,
     lb_channel_controller: LbChannelController,
     config_selector: SharedConfigSelector,
-    /// The client-side health checking service name.  Every subchannel gets a
-    /// receiver, for its health producer.
+    /// The client-side health checking service name from the service config.
+    /// Every subchannel gets a receiver, for its health producer.
     health_service_name: watch::Sender<Option<String>>,
 }
 
@@ -616,6 +616,27 @@ impl name_resolution::ChannelController for ResolverChannelController {
             Ok(Some(sc)) => sc.lb_config(),
             _ => ServiceConfig::default_lb_policy(),
         };
+
+        // Update the health check service name before the LB policy, so that
+        // subchannels it creates start with the new name.
+        //
+        // TODO: the channel API must provide an option to disable client-side
+        // health checking even when the service config enables it.
+        //
+        // TODO: once service config error handling (gRFC A21) is implemented,
+        // keep the previous name when the resolver returns an invalid service
+        // config.
+        let health_service_name = match update.service_config.as_ref() {
+            Ok(Some(sc)) => sc.health_check_service_name(),
+            _ => None,
+        };
+        self.health_service_name.send_if_modified(|name| {
+            if *name == health_service_name {
+                return false;
+            }
+            *name = health_service_name;
+            true
+        });
 
         let cfg_selector = update.take_config_selector();
 

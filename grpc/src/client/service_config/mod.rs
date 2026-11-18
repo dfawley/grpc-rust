@@ -91,6 +91,15 @@ impl ServiceConfig {
     pub(crate) fn default_lb_policy() -> (Arc<DynLbPolicyBuilder>, DynLbConfig) {
         DEFAULT_PICK_FIRST.clone()
     }
+
+    // Returns the client-side health checking service name
+    // (`healthCheckConfig.serviceName`), if any.
+    pub(crate) fn health_check_service_name(&self) -> Option<String> {
+        self.inner
+            .health_check_config
+            .as_ref()
+            .and_then(|c| c.service_name.clone())
+    }
 }
 
 #[cfg(test)]
