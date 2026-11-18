@@ -36,6 +36,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::SetOnce;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 use crate::StatusCodeError;
 use crate::StatusError;
@@ -571,6 +572,9 @@ struct ResolverChannelController {
     lb_work_scheduler: Arc<LbWorkScheduler>,
     lb_channel_controller: LbChannelController,
     config_selector: SharedConfigSelector,
+    /// The client-side health checking service name.  Every subchannel gets a
+    /// receiver, for its health producer.
+    health_service_name: watch::Sender<Option<String>>,
 }
 
 impl ResolverChannelController {
@@ -582,12 +586,14 @@ impl ResolverChannelController {
         config_selector: SharedConfigSelector,
     ) -> Self {
         let lb_work_scheduler = Arc::new(LbWorkScheduler { wqtx: wqtx.clone() });
+        let (health_service_name, health_service_name_rx) = watch::channel(None);
         let lb_channel_controller = LbChannelController {
             lb_work_scheduler: lb_work_scheduler.clone(),
             transport_registry: GLOBAL_TRANSPORT_REGISTRY.clone(),
             lb_watcher,
             runtime: runtime.clone(),
             security_opts,
+            health_service_name: health_service_name_rx,
         };
         Self {
             lb_policy: SubchannelSharing::new(
@@ -599,6 +605,7 @@ impl ResolverChannelController {
             wqtx: wqtx.clone(),
             runtime: runtime.clone(),
             config_selector,
+            health_service_name,
         }
     }
 }
@@ -646,6 +653,7 @@ struct LbChannelController {
     lb_watcher: Arc<Watcher<LbState>>,
     runtime: GrpcRuntime, // For creating subchannels
     security_opts: SecurityOpts,
+    health_service_name: watch::Receiver<Option<String>>, // For creating subchannels
 }
 
 impl load_balancing::ChannelController for LbChannelController {
@@ -668,6 +676,7 @@ impl load_balancing::ChannelController for LbChannelController {
                 self.runtime.clone(),
                 self.security_opts.clone(),
                 work_scheduler,
+                self.health_service_name.clone(),
             ),
             SubchannelState::idle(),
         )

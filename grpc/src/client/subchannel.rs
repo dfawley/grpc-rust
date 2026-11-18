@@ -35,6 +35,7 @@ use std::time::Instant;
 
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 use crate::StatusCodeError;
 use crate::StatusError;
@@ -43,11 +44,13 @@ use crate::client::ConnectivityState;
 use crate::client::Invoke;
 use crate::client::InvokeOnce;
 use crate::client::RequestHeaders;
+use crate::client::boxed::ArcInvoker;
 use crate::client::boxed::BoxInvoker;
 use crate::client::boxed::BoxRecvStream;
 use crate::client::boxed::BoxSendStream;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
+use crate::client::load_balancing::producer::ProducerSet;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel::SubchannelUpdate;
@@ -256,6 +259,8 @@ impl Invoke for InternalSubchannel {
     ) -> (Self::SendStream, Self::RecvStream) {
         match self.ready_invoker() {
             Ok(invoker) => invoker.invoke_once(headers, options).await,
+            // Producers hold an invoker for the subchannel's whole lifetime,
+            // so RPCs can be started while it is not READY.
             Err(SubchannelNotReady) => FailingRecvStream::new_stream_pair(
                 StatusError::new(
                     StatusCodeError::Unavailable,
@@ -271,6 +276,9 @@ pub(crate) struct InternalSubchannel {
     address: Address,
     data: Arc<Mutex<InternalSubchannelData>>,
     on_drop: Arc<Notify>,
+    /// Returned as an attribute, so watches on any wrapper of this subchannel
+    /// find it.
+    producers: ProducerSet,
 }
 
 struct InternalSubchannelData {
@@ -284,6 +292,7 @@ struct InternalSubchannelData {
     transport_options: TransportOptions,
     security_opts: SecurityOpts,
     weak_self: Weak<InternalSubchannel>,
+    producers: ProducerSet,
 }
 
 impl InternalSubchannelData {
@@ -298,8 +307,45 @@ impl InternalSubchannelData {
         // Send the update directly to the subchannel's work scheduler.
         self.work_scheduler
             .schedule_work(Some(WorkData::new(SubchannelUpdate::new(
-                subchannel, state,
+                subchannel,
+                state.clone(),
             ))));
+
+        // Then tell the producers, still under the lock, so they see every
+        // change in order, and anything they send for this change is
+        // scheduled after the SubchannelUpdate above.
+        //
+        // TODO: SubchannelSharing passes the SubchannelUpdate above through
+        // the work queue a second time before delivering it to the policy, but
+        // producer data goes to the policy directly.  So a policy can see
+        // producer data sent for this change (e.g. health) before the
+        // SubchannelUpdate for it.
+        self.producers.subchannel_state(&state);
+    }
+}
+
+/// The invoker given to producers.  Holds the subchannel weakly, since the
+/// subchannel owns its producers.
+struct ProducerInvoker {
+    subchannel: Weak<InternalSubchannel>,
+}
+
+impl Invoke for ProducerInvoker {
+    type SendStream = BoxSendStream;
+    type RecvStream = BoxRecvStream;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
+        let Some(subchannel) = self.subchannel.upgrade() else {
+            return FailingRecvStream::new_stream_pair(
+                StatusError::new(StatusCodeError::Unavailable, "subchannel was shut down"),
+                None,
+            );
+        };
+        subchannel.invoke(headers, options).await
     }
 }
 
@@ -310,7 +356,10 @@ impl Subchannel for InternalSubchannel {
         self.address.clone()
     }
 
-    fn get_attribute_dyn(&self, _id: std::any::TypeId) -> Option<&dyn std::any::Any> {
+    fn get_attribute_dyn(&self, id: std::any::TypeId) -> Option<&dyn std::any::Any> {
+        if id == std::any::TypeId::of::<ProducerSet>() {
+            return Some(&self.producers);
+        }
         None
     }
 
@@ -358,6 +407,7 @@ impl InternalSubchannel {
         runtime: GrpcRuntime,
         mut security_opts: SecurityOpts,
         work_scheduler: Arc<dyn WorkScheduler>,
+        health_service_name: watch::Receiver<Option<String>>,
     ) -> Arc<dyn Subchannel> {
         let on_drop = Arc::new(Notify::new());
         if let Some(proxy_opts) = ProxyOptions::from_addr(&address) {
@@ -366,21 +416,34 @@ impl InternalSubchannel {
                 proxy_opts,
             ));
         }
-        let this = Arc::new_cyclic(|weak_self| Self {
-            address: address.clone(),
-            on_drop: on_drop.clone(),
-            data: Arc::new(Mutex::new(InternalSubchannelData {
-                address,
-                transport_builder: transport,
-                backoff,
-                weak_self: weak_self.clone(),
-                runtime,
-                state: InternalSubchannelState::Idle,
-                work_scheduler,
-                on_drop,
-                transport_options: TransportOptions::default(), // TODO: should be configurable
-                security_opts,
-            })),
+        let this = Arc::new_cyclic(|weak_self: &Weak<Self>| {
+            let producers = ProducerSet::new(
+                SubchannelState::idle(),
+                ArcInvoker::new(ProducerInvoker {
+                    subchannel: weak_self.clone(),
+                }),
+                address.clone(),
+                runtime.clone(),
+                health_service_name,
+            );
+            Self {
+                address: address.clone(),
+                on_drop: on_drop.clone(),
+                producers: producers.clone(),
+                data: Arc::new(Mutex::new(InternalSubchannelData {
+                    address,
+                    transport_builder: transport,
+                    backoff,
+                    weak_self: weak_self.clone(),
+                    runtime,
+                    state: InternalSubchannelState::Idle,
+                    work_scheduler,
+                    on_drop,
+                    transport_options: TransportOptions::default(), // TODO: should be configurable
+                    security_opts,
+                    producers,
+                })),
+            }
         });
         // Do not report the initial state; the initial state is returned
         // synchronously.
