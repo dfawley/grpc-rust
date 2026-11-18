@@ -223,6 +223,7 @@ mod tests {
 
     use grpc::__unstable::client::load_balancing::GLOBAL_LB_REGISTRY;
     use grpc::__unstable::client::load_balancing::WorkQueue;
+    use grpc::__unstable::client::load_balancing::WorkRoute;
     use grpc::__unstable::client::load_balancing::WorkScheduler;
     use grpc::__unstable::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
     use grpc::__unstable::client::load_balancing::subchannel::Subchannel;
@@ -569,7 +570,7 @@ mod tests {
         fn new_subchannel(
             &mut self,
             _address: &Address,
-            _work_scheduler: WorkScheduler,
+            _route: WorkRoute,
         ) -> (Arc<dyn Subchannel>, SubchannelState) {
             unimplemented!()
         }

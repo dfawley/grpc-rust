@@ -61,7 +61,6 @@ pub use registry::GLOBAL_LB_REGISTRY;
 pub use work::Hop;
 pub use work::WorkData;
 pub use work::WorkQueue;
-#[allow(unused_imports)] // Public API, re-exported via __unstable.
 pub use work::WorkRoute;
 pub use work::WorkScheduler;
 
@@ -130,8 +129,8 @@ pub trait LbPolicy: Send + Sync + Debug + 'static {
     /// WorkScheduler's `schedule_work` method.
     ///
     /// This is also how subchannel state updates are delivered: when a
-    /// subchannel created by this policy changes state, the channel schedules
-    /// work on the WorkScheduler that was passed to
+    /// subchannel created by this policy changes state, the channel delivers
+    /// work via the route that was passed to
     /// [`ChannelController::new_subchannel`], and `data` contains a
     /// [`SubchannelUpdate`](subchannel::SubchannelUpdate).
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController);
@@ -284,19 +283,24 @@ impl LbConfigJson {
 pub trait ChannelController: Send + Sync {
     /// Creates a new subchannel and returns its current state.
     ///
-    /// Whenever the subchannel changes state, the channel calls
-    /// [`schedule_work`](WorkScheduler::schedule_work) on `work_scheduler`
-    /// with a [`SubchannelUpdate`](subchannel::SubchannelUpdate) describing the
-    /// new state.  Policies should generally pass the WorkScheduler they were
-    /// given in [`LbPolicyOptions`] so the update is routed back to them.
+    /// Whenever the subchannel changes state, a
+    /// [`SubchannelUpdate`](subchannel::SubchannelUpdate) describing the new
+    /// state is delivered to the policy that `route` addresses.  Policies
+    /// should generally pass the route of the WorkScheduler they were given in
+    /// [`LbPolicyOptions`] so the update is routed back to them.
     ///
-    /// Note that `work_scheduler` may be called before this method returns.
-    /// However, no update for the state returned by this method should be
-    /// expected.
+    /// Updates are delivered in a later call to the policy's `work` method,
+    /// never during this call, and start from the state returned here.
+    ///
+    /// A parent that intercepts this call (by wrapping the ChannelController
+    /// it passes to its children) may deliver updates for the subchannel
+    /// itself: [`WorkRoute::envelope_below`] with its own route wraps an
+    /// update as the parent's own `work` method receives it, so the parent can
+    /// route it to the child directly.
     fn new_subchannel(
         &mut self,
         address: &Address,
-        work_scheduler: WorkScheduler,
+        route: WorkRoute,
     ) -> (Arc<dyn Subchannel>, SubchannelState);
 
     /// Provides a new snapshot of the LB policy's state to the channel.

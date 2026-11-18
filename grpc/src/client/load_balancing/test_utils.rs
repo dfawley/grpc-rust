@@ -49,6 +49,7 @@ use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkQueue;
+use crate::client::load_balancing::WorkRoute;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::ForwardingSubchannel;
 use crate::client::load_balancing::subchannel::SubchannelUpdate;
@@ -66,9 +67,9 @@ pub fn new_request_headers() -> RequestHeaders {
 pub struct TestSubchannel {
     address: Address,
     tx_connect: mpsc::Sender<TestEvent>,
-    // The work scheduler provided by the policy that created this subchannel,
-    // used to deliver state updates about it.  None for subchannels that were
-    // not created through a TestChannelController.
+    // Delivers state updates about this subchannel via the route provided by
+    // the policy that created it.  None for subchannels that were not created
+    // through a TestChannelController.
     work_scheduler: Option<WorkScheduler>,
 }
 
@@ -94,9 +95,9 @@ impl TestSubchannel {
     }
 }
 
-/// Simulates a state change of `subchannel` by scheduling the update on the
-/// WorkScheduler that the creating policy passed to `new_subchannel`, exactly
-/// as the channel would.
+/// Simulates a state change of `subchannel` by scheduling the update via the
+/// route that the creating policy passed to `new_subchannel`, as the channel
+/// would.
 ///
 /// `subchannel` must have been created by a [`TestChannelController`].  The
 /// resulting work is observable via [`TestEnv::expect_schedule_work`], and
@@ -170,15 +171,24 @@ impl Debug for TestEvent {
 /// update the picker.
 pub struct TestChannelController {
     pub tx_events: mpsc::Sender<TestEvent>,
+    /// Where subchannels this controller creates send their state updates,
+    /// like the channel's work queue.
+    pub tx_work: mpsc::Sender<Option<WorkData>>,
 }
 
 impl ChannelController for TestChannelController {
     fn new_subchannel(
         &mut self,
         address: &Address,
-        work_scheduler: WorkScheduler,
+        route: WorkRoute,
     ) -> (Arc<dyn Subchannel>, SubchannelState) {
         println!("new_subchannel called for address {}", address);
+        let work_scheduler = WorkScheduler::new(
+            route,
+            Arc::new(TestWorkQueue {
+                tx_work: self.tx_work.clone(),
+            }),
+        );
         let subchannel: Arc<dyn Subchannel> = Arc::new(TestSubchannel::new_with_work_scheduler(
             address.clone(),
             self.tx_events.clone(),
@@ -264,10 +274,10 @@ impl<P> TestEnv<P> {
     pub fn new(build_policy: impl FnOnce(WorkScheduler) -> P) -> Self {
         let (tx_events, rx_events) = mpsc::channel::<TestEvent>();
         let (tx_work, rx_work) = mpsc::channel::<Option<WorkData>>();
-        let work_scheduler = TestWorkQueue::new_scheduler(tx_work);
+        let work_scheduler = TestWorkQueue::new_scheduler(tx_work.clone());
         Self {
             policy: build_policy(work_scheduler),
-            tcc: TestChannelController { tx_events },
+            tcc: TestChannelController { tx_events, tx_work },
             rx_events,
             rx_work,
         }

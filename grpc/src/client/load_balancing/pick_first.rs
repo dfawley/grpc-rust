@@ -179,7 +179,7 @@ impl PickFirstPolicy {
                 // Get a new subchannel handle from the controller if we don't
                 // have an existing one.  Updates for it are delivered to our
                 // work method via our work scheduler.
-                channel_controller.new_subchannel(&addr, self.work_scheduler.clone())
+                channel_controller.new_subchannel(&addr, self.work_scheduler.route().clone())
             };
 
             // Track the best candidate for immediate activation:

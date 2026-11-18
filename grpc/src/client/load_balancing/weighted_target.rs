@@ -316,8 +316,10 @@ mod tests {
                         address: target.to_string().into(),
                         ..Default::default()
                     };
-                    let (subchannel, _) = controller
-                        .new_subchannel(&address, data.lb_policy_options.work_scheduler.clone());
+                    let (subchannel, _) = controller.new_subchannel(
+                        &address,
+                        data.lb_policy_options.work_scheduler.route().clone(),
+                    );
                     data.test_data = Some(Box::new(StubState {
                         subchannel,
                         state: ConnectivityState::Connecting,
@@ -831,7 +833,7 @@ mod tests {
                 resolver_update: Some(Arc::new(|data, _update, _cfg, controller| {
                     controller.new_subchannel(
                         &Address::default(),
-                        data.lb_policy_options.work_scheduler.clone(),
+                        data.lb_policy_options.work_scheduler.route().clone(),
                     );
                     Ok(())
                 })),

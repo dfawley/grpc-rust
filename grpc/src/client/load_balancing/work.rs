@@ -204,10 +204,14 @@ impl WorkScheduler {
     /// Creates a WorkScheduler for the root policy.  Only the channel (and
     /// tests) create root schedulers.
     pub(crate) fn new_root(queue: Arc<dyn WorkQueue>) -> Self {
-        Self {
-            route: WorkRoute::root(),
-            queue,
-        }
+        Self::new(WorkRoute::root(), queue)
+    }
+
+    /// Creates a WorkScheduler for the policy at `route`.  Used by the channel
+    /// (and its test fakes) to deliver subchannel updates via the route passed
+    /// to `new_subchannel`.
+    pub(crate) fn new(route: WorkRoute, queue: Arc<dyn WorkQueue>) -> Self {
+        Self { route, queue }
     }
 
     /// Returns a WorkScheduler on the same queue whose route is one level

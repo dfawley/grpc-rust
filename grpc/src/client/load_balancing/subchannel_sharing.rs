@@ -37,6 +37,7 @@ use crate::client::load_balancing::PickOptions;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::WorkData;
+use crate::client::load_balancing::WorkRoute;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::ForwardingSubchannel;
 use crate::client::load_balancing::subchannel::Subchannel;
@@ -72,9 +73,13 @@ impl<T> SubchannelSharing<T> {
     }
 
     /// Translates a state change of an internal subchannel into one update per
-    /// external subchannel backed by it, delivered via the WorkScheduler that
-    /// the creating policy passed to `new_subchannel`.
-    fn deliver_subchannel_update(&mut self, update: SubchannelUpdate) {
+    /// external subchannel backed by it, for the policy that created it.
+    ///
+    /// Each update is wrapped by the creating policy's route only up to this
+    /// policy, so it is exactly what this policy's own `work` method receives
+    /// for that policy.  The caller passes the updates to `work` directly
+    /// instead of scheduling them, so nothing else happens in between.
+    fn subchannel_updates(&mut self, update: SubchannelUpdate) -> Vec<Option<WorkData>> {
         let Some(entry) = self
             .inner
             .subchannels_int_to_ext
@@ -82,19 +87,20 @@ impl<T> SubchannelSharing<T> {
         else {
             // The internal subchannel has been released.  Nobody is interested
             // in this update.
-            return;
+            return Vec::new();
         };
         // Remember the state for any external subchannels created later.
         entry.state = update.state.clone();
-        for (weak, work_scheduler) in entry.ext_subchannels.iter() {
-            let Some(ext_subchannel) = weak.upgrade() else {
-                continue;
-            };
-            work_scheduler.schedule_work(Some(WorkData::new(SubchannelUpdate::new(
-                ext_subchannel,
-                update.state.clone(),
-            ))));
-        }
+        let own_route = self.work_scheduler.route();
+        entry
+            .ext_subchannels
+            .iter()
+            .filter_map(|(weak, route)| {
+                let ext_subchannel = weak.upgrade()?;
+                let update = SubchannelUpdate::new(ext_subchannel, update.state.clone());
+                Some(route.envelope_below(own_route, Some(WorkData::new(update))))
+            })
+            .collect()
     }
 
     /// Forgets any external subchannels backed by `int_subchannel` that have
@@ -137,8 +143,8 @@ struct InternalSubchannelEntry {
     /// that create another external subchannel for the same address.
     state: SubchannelState,
     /// The external subchannels backed by this internal subchannel, along with
-    /// the WorkScheduler used to deliver updates about each of them.
-    ext_subchannels: HashMap<WeakSubchannel, WorkScheduler>,
+    /// the route used to deliver updates about each of them.
+    ext_subchannels: HashMap<WeakSubchannel, WorkRoute>,
 }
 
 #[derive(Debug)]
@@ -174,7 +180,11 @@ impl<T: LbPolicy> LbPolicy for SubchannelSharing<T> {
         let data = match data.map(|d| d.downcast::<SharingWork>()) {
             Some(Ok(work)) => {
                 return match work {
-                    SharingWork::InternalUpdate(u) => self.deliver_subchannel_update(u),
+                    SharingWork::InternalUpdate(u) => {
+                        for data in self.subchannel_updates(u) {
+                            self.work(data, channel_controller);
+                        }
+                    }
                     SharingWork::Released(sc) => self.release_subchannel(&sc),
                 };
             }
@@ -242,8 +252,8 @@ impl Drop for SharedSubchannel {
     }
 }
 
-/// The hop below the SubchannelSharing policy's route in the WorkScheduler
-/// given to the channel for every internal subchannel.
+/// The hop below the SubchannelSharing policy's route in the route given to
+/// the channel for every internal subchannel.
 ///
 /// The channel may use this from any thread, and even before `new_subchannel`
 /// has returned, i.e. before the subchannel has been registered.  So it does no
@@ -281,7 +291,7 @@ impl ChannelController for SharingChannelController<'_> {
     fn new_subchannel(
         &mut self,
         address: &Address,
-        work_scheduler: WorkScheduler,
+        route: WorkRoute,
     ) -> (Arc<dyn Subchannel>, SubchannelState) {
         // Find the existing internal subchannel with this address, if any.
         let existing = self.inner.subchannels_by_address.get(address).cloned();
@@ -295,7 +305,9 @@ impl ChannelController for SharingChannelController<'_> {
                 // by which time the registration below has completed.
                 let (int_subchannel, state) = self.delegate.new_subchannel(
                     address,
-                    self.work_scheduler.child(Arc::new(SubchannelUpdateHop)),
+                    self.work_scheduler
+                        .route()
+                        .child(Arc::new(SubchannelUpdateHop)),
                 );
                 self.inner
                     .subchannels_by_address
@@ -310,8 +322,7 @@ impl ChannelController for SharingChannelController<'_> {
         });
 
         // Insert a weak reference to this new external subchannel, along with
-        // the work scheduler used to deliver its updates, into the int->ext
-        // map.
+        // the route used to deliver its updates, into the int->ext map.
         let entry = self
             .inner
             .subchannels_int_to_ext
@@ -323,7 +334,7 @@ impl ChannelController for SharingChannelController<'_> {
 
         entry
             .ext_subchannels
-            .insert((&ext_subchannel).into(), work_scheduler);
+            .insert((&ext_subchannel).into(), route);
 
         let state = entry.state.clone();
         (ext_subchannel, state)
@@ -405,9 +416,8 @@ mod tests {
     // Constructs the test environment for SubchannelSharing tests, wrapping a
     // StubPolicy with the given funcs.
     //
-    // Subchannel updates take two trips through the work scheduler: one to
-    // SubchannelSharing and one to the delegate.  Tests must call run_work
-    // after send_subchannel_update to deliver the second.
+    // Subchannel updates are scheduled to SubchannelSharing, which delivers
+    // one to the delegate per external subchannel in the same call.
     fn new_env(funcs: StubPolicyFuncs) -> TestEnv<SubchannelSharing<StubPolicy>> {
         TestEnv::new(|work_scheduler| {
             let options = LbPolicyOptions {
@@ -433,7 +443,7 @@ mod tests {
                     ..Default::default()
                 };
                 let sc = cc
-                    .new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
+                    .new_subchannel(&addr, data.lb_policy_options.work_scheduler.route().clone())
                     .0;
                 *sc_out_clone.lock().unwrap() = Some(sc);
             })),
@@ -465,11 +475,11 @@ mod tests {
                     ..Default::default()
                 };
                 *sc_out1_clone.lock().unwrap() = Some(
-                    cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
+                    cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.route().clone())
                         .0,
                 );
                 *sc_out2_clone.lock().unwrap() = Some(
-                    cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
+                    cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.route().clone())
                         .0,
                 );
             })),
@@ -517,12 +527,18 @@ mod tests {
                     ..Default::default()
                 };
                 *sc_out1_clone.lock().unwrap() = Some(
-                    cc.new_subchannel(&addr1, data.lb_policy_options.work_scheduler.clone())
-                        .0,
+                    cc.new_subchannel(
+                        &addr1,
+                        data.lb_policy_options.work_scheduler.route().clone(),
+                    )
+                    .0,
                 );
                 *sc_out2_clone.lock().unwrap() = Some(
-                    cc.new_subchannel(&addr2, data.lb_policy_options.work_scheduler.clone())
-                        .0,
+                    cc.new_subchannel(
+                        &addr2,
+                        data.lb_policy_options.work_scheduler.route().clone(),
+                    )
+                    .0,
                 );
             })),
             ..Default::default()
@@ -575,17 +591,26 @@ mod tests {
                 let mut num_calls = work_calls_clone.lock().unwrap();
                 if *num_calls == 0 {
                     *sc_out1_clone.lock().unwrap() = Some(
-                        cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
-                            .0,
+                        cc.new_subchannel(
+                            &addr,
+                            data.lb_policy_options.work_scheduler.route().clone(),
+                        )
+                        .0,
                     );
                     *sc_out2_clone.lock().unwrap() = Some(
-                        cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
-                            .0,
+                        cc.new_subchannel(
+                            &addr,
+                            data.lb_policy_options.work_scheduler.route().clone(),
+                        )
+                        .0,
                     );
                 } else if *num_calls == 1 {
                     *sc_out3_clone.lock().unwrap() = Some(
-                        cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
-                            .0,
+                        cc.new_subchannel(
+                            &addr,
+                            data.lb_policy_options.work_scheduler.route().clone(),
+                        )
+                        .0,
                     );
                 }
                 *num_calls += 1;
@@ -610,7 +635,7 @@ mod tests {
         // Perform a subchannel update and confirm that two calls are made to
         // the delegate.
         env.send_subchannel_update(&internal_sc, &state);
-        env.run_work();
+        env.expect_no_events();
         assert_eq!(*update_calls.lock().unwrap(), 2);
 
         // Drop one external subchannel and process the work it produces.
@@ -620,7 +645,7 @@ mod tests {
         // Perform a subchannel update and confirm that only one call is made.
         *update_calls.lock().unwrap() = 0;
         env.send_subchannel_update(&internal_sc, &state);
-        env.run_work();
+        env.expect_no_events();
         assert_eq!(*update_calls.lock().unwrap(), 1);
 
         // We should have 4 strong references to the internal subchannel: ours,
@@ -678,11 +703,11 @@ mod tests {
                     ..Default::default()
                 };
                 *sc_out1_clone.lock().unwrap() = Some(
-                    cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
+                    cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.route().clone())
                         .0,
                 );
                 *sc_out2_clone.lock().unwrap() = Some(
-                    cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
+                    cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.route().clone())
                         .0,
                 );
             })),
@@ -704,14 +729,14 @@ mod tests {
 
         // Verify that two delegated update calls are made.
         env.send_subchannel_update(&internal_sc, &state);
-        env.run_work();
+        env.expect_no_events();
         assert_eq!(*update_calls.lock().unwrap(), 2);
 
         // Drop one and verify that one delegated update call is made.
         drop(external_sc1);
         env.run_work();
         env.send_subchannel_update(&internal_sc, &state);
-        env.run_work();
+        env.expect_no_events();
         assert_eq!(*update_calls.lock().unwrap(), 3);
     }
 
@@ -729,7 +754,7 @@ mod tests {
                     ..Default::default()
                 };
                 let sc = cc
-                    .new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
+                    .new_subchannel(&addr, data.lb_policy_options.work_scheduler.route().clone())
                     .0;
                 *sc_out_clone.lock().unwrap() = Some(sc.clone());
 
@@ -819,7 +844,7 @@ mod tests {
     // new_subchannel.
     #[test]
     fn test_new_subchannel_state() {
-        type WorkFn = Box<dyn FnOnce(&mut dyn ChannelController, WorkScheduler) + Send>;
+        type WorkFn = Box<dyn FnOnce(&mut dyn ChannelController, WorkRoute) + Send>;
         let (tx_work, rx_work) = mpsc::channel::<WorkFn>();
         // Wrap rx_work in a mutex to allow the stub work Fn() closure to access
         // it mutably.
@@ -833,8 +858,8 @@ mod tests {
                 if let Some(Ok(_)) = work_item.map(|d| d.downcast::<SubchannelUpdate>()) {
                     return;
                 }
-                let work_scheduler = data.lb_policy_options.work_scheduler.clone();
-                (rx_work_clone.lock().unwrap().recv().unwrap())(cc, work_scheduler);
+                let route = data.lb_policy_options.work_scheduler.route().clone();
+                (rx_work_clone.lock().unwrap().recv().unwrap())(cc, route);
             })),
             ..Default::default()
         });
@@ -850,8 +875,8 @@ mod tests {
         let sc1_clone = sc1.clone();
         let addr_clone = addr.clone();
         tx_work
-            .send(Box::new(move |cc, work_scheduler| {
-                let (sc, state) = cc.new_subchannel(&addr_clone, work_scheduler);
+            .send(Box::new(move |cc, route| {
+                let (sc, state) = cc.new_subchannel(&addr_clone, route);
                 assert_eq!(state.connectivity_state, ConnectivityState::Idle);
                 *sc1_clone.lock().unwrap() = Some(sc);
             }))
@@ -861,14 +886,14 @@ mod tests {
 
         // Update the state to Connecting.
         env.send_subchannel_update(&int_sc, &SubchannelState::connecting());
-        env.run_work();
+        env.expect_no_events();
 
         // Create a second subchannel for the address and verify that the state
         // is also Connecting.
         let addr_clone = addr.clone();
         tx_work
-            .send(Box::new(move |cc, work_scheduler| {
-                let (_sc, state) = cc.new_subchannel(&addr_clone, work_scheduler);
+            .send(Box::new(move |cc, route| {
+                let (_sc, state) = cc.new_subchannel(&addr_clone, route);
                 assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
             }))
             .unwrap();
@@ -877,14 +902,14 @@ mod tests {
 
         // Update the state to Ready.
         env.send_subchannel_update(&int_sc, &SubchannelState::ready());
-        env.run_work();
+        env.expect_no_events();
 
         // Create another subchannel for the address and verify that the state
         // is now Ready.
         let addr_clone = addr.clone();
         tx_work
-            .send(Box::new(move |cc, work_scheduler| {
-                let (_sc, state) = cc.new_subchannel(&addr_clone, work_scheduler);
+            .send(Box::new(move |cc, route| {
+                let (_sc, state) = cc.new_subchannel(&addr_clone, route);
                 assert_eq!(state.connectivity_state, ConnectivityState::Ready);
             }))
             .unwrap();
@@ -901,14 +926,21 @@ mod tests {
     // policy can handle an eager update before new_subchannel returns.
     struct EagerUpdateChannelController {
         tx_events: mpsc::Sender<TestEvent>,
+        tx_work: mpsc::Sender<Option<WorkData>>,
     }
 
     impl ChannelController for EagerUpdateChannelController {
         fn new_subchannel(
             &mut self,
             address: &Address,
-            work_scheduler: WorkScheduler,
+            route: WorkRoute,
         ) -> (Arc<dyn Subchannel>, SubchannelState) {
+            let work_scheduler = WorkScheduler::new(
+                route,
+                Arc::new(TestWorkQueue {
+                    tx_work: self.tx_work.clone(),
+                }),
+            );
             let subchannel: Arc<dyn Subchannel> =
                 Arc::new(TestSubchannel::new_with_work_scheduler(
                     address.clone(),
@@ -944,7 +976,10 @@ mod tests {
     fn test_update_during_new_subchannel_is_delivered() {
         let (tx_events, rx_events) = mpsc::channel();
         let (tx_work, rx_work) = mpsc::channel();
-        let mut cc = EagerUpdateChannelController { tx_events };
+        let mut cc = EagerUpdateChannelController {
+            tx_events,
+            tx_work: tx_work.clone(),
+        };
 
         let updates = Arc::new(Mutex::new(Vec::new()));
         let updates_clone = updates.clone();
@@ -969,8 +1004,11 @@ mod tests {
                     // The returned subchannel must be kept alive: the fan-out
                     // only delivers to external subchannels that still exist.
                     *sc_out_clone.lock().unwrap() = Some(
-                        cc.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone())
-                            .0,
+                        cc.new_subchannel(
+                            &addr,
+                            data.lb_policy_options.work_scheduler.route().clone(),
+                        )
+                        .0,
                     );
                 })),
                 ..Default::default()

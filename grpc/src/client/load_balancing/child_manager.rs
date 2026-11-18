@@ -53,6 +53,7 @@ use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
+use crate::client::load_balancing::WorkRoute;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::core::Address;
@@ -456,10 +457,9 @@ impl ChannelController for WrappedController<'_> {
     fn new_subchannel(
         &mut self,
         address: &Address,
-        work_scheduler: WorkScheduler,
+        route: WorkRoute,
     ) -> (Arc<dyn Subchannel>, SubchannelState) {
-        self.channel_controller
-            .new_subchannel(address, work_scheduler)
+        self.channel_controller.new_subchannel(address, route)
     }
 
     fn update_picker(&mut self, update: LbState) {
@@ -522,15 +522,23 @@ mod test {
 
     use crate::attributes::Attributes;
     use crate::client::ConnectivityState;
+    use crate::client::load_balancing::ChannelController;
     use crate::client::load_balancing::DynLbConfig;
     use crate::client::load_balancing::DynLbPolicyBuilder;
     use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
+    use crate::client::load_balancing::LbPolicy;
+    use crate::client::load_balancing::LbPolicyOptions;
     use crate::client::load_balancing::LbState;
     use crate::client::load_balancing::QueuingPicker;
     use crate::client::load_balancing::Subchannel;
     use crate::client::load_balancing::SubchannelState;
+    use crate::client::load_balancing::WorkData;
+    use crate::client::load_balancing::WorkRoute;
+    use crate::client::load_balancing::WorkScheduler;
+    use crate::client::load_balancing::child_manager::Child;
     use crate::client::load_balancing::child_manager::ChildManager;
     use crate::client::load_balancing::child_manager::ChildUpdate;
+    use crate::client::load_balancing::child_manager::ChildWorkItem;
     use crate::client::load_balancing::subchannel::SubchannelUpdate;
     use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
@@ -634,7 +642,7 @@ mod test {
                     let endpoint = update.endpoints.unwrap().pop().unwrap();
                     controller.new_subchannel(
                         &endpoint.addresses[0],
-                        data.lb_policy_options.work_scheduler.clone(),
+                        data.lb_policy_options.work_scheduler.route().clone(),
                     );
                     Ok(())
                 },
@@ -845,7 +853,10 @@ mod test {
 
         let (tx_events, _rx_events) = mpsc::channel::<TestEvent>();
         let (tx_work, rx_work) = mpsc::channel();
-        let mut tcc = TestChannelController { tx_events };
+        let mut tcc = TestChannelController {
+            tx_events,
+            tx_work: tx_work.clone(),
+        };
 
         let names = [name1, name2];
         let mut child_manager =
@@ -975,5 +986,210 @@ mod test {
         let _ = env.verify_subchannel_creation(1);
         assert!(env.policy.child_updated());
         assert!(!env.policy.child_updated());
+    }
+
+    // A parent below the root with one child.  It intercepts new_subchannel
+    // calls from below it, and can deliver states for those subchannels to the
+    // policy that created them by calling into its child directly.
+    #[derive(Debug)]
+    struct Interceptor {
+        work_scheduler: WorkScheduler,
+        child: Child<Leaf>,
+        intercepted: Vec<(Arc<dyn Subchannel>, WorkRoute)>,
+    }
+
+    // Work for the Interceptor itself: deliver this state for every intercepted
+    // subchannel.
+    #[derive(Debug)]
+    struct Inject(SubchannelState);
+
+    impl Interceptor {
+        fn new(options: LbPolicyOptions, states: Arc<Mutex<Vec<ConnectivityState>>>) -> Self {
+            let work_scheduler = options.work_scheduler.clone();
+            let child = Child::from_fn("leaf", options, |options| Leaf {
+                work_scheduler: options.work_scheduler,
+                states,
+                subchannel: None,
+            });
+            Self {
+                work_scheduler,
+                child,
+                intercepted: Vec::new(),
+            }
+        }
+    }
+
+    struct InterceptingController<'a> {
+        delegate: &'a mut dyn ChannelController,
+        intercepted: &'a mut Vec<(Arc<dyn Subchannel>, WorkRoute)>,
+    }
+
+    impl ChannelController for InterceptingController<'_> {
+        fn new_subchannel(
+            &mut self,
+            address: &Address,
+            route: WorkRoute,
+        ) -> (Arc<dyn Subchannel>, SubchannelState) {
+            let (subchannel, state) = self.delegate.new_subchannel(address, route.clone());
+            self.intercepted.push((subchannel.clone(), route));
+            (subchannel, state)
+        }
+
+        fn update_picker(&mut self, update: LbState) {
+            self.delegate.update_picker(update);
+        }
+
+        fn request_resolution(&mut self) {
+            self.delegate.request_resolution();
+        }
+    }
+
+    impl LbPolicy for Interceptor {
+        type LbConfig = ();
+
+        fn resolver_update(
+            &mut self,
+            update: ResolverUpdate,
+            _config: &(),
+            channel_controller: &mut dyn ChannelController,
+        ) -> Result<(), String> {
+            let mut channel_controller = InterceptingController {
+                delegate: channel_controller,
+                intercepted: &mut self.intercepted,
+            };
+            self.child
+                .resolver_update(update, &(), &mut channel_controller)
+        }
+
+        fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
+            let inject = match data.expect("expected work data").downcast::<Inject>() {
+                Ok(inject) => inject,
+                Err(data) => {
+                    // Everything else is for the child.
+                    self.child
+                        .try_work(data, channel_controller)
+                        .expect("work must be for the child");
+                    return;
+                }
+            };
+            for (subchannel, route) in &self.intercepted {
+                let update = SubchannelUpdate::new(subchannel.clone(), inject.0.clone());
+                // Wrapped as this policy's own work method receives it.
+                let data = route
+                    .envelope_below(self.work_scheduler.route(), Some(WorkData::new(update)))
+                    .expect("the child's hop wraps the update");
+                self.child
+                    .try_work(data, channel_controller)
+                    .expect("work must be for the child");
+            }
+        }
+
+        fn exit_idle(&mut self, _channel_controller: &mut dyn ChannelController) {}
+    }
+
+    // A leaf policy that creates one subchannel and records its states.
+    #[derive(Debug)]
+    struct Leaf {
+        work_scheduler: WorkScheduler,
+        states: Arc<Mutex<Vec<ConnectivityState>>>,
+        subchannel: Option<Arc<dyn Subchannel>>,
+    }
+
+    impl LbPolicy for Leaf {
+        type LbConfig = ();
+
+        fn resolver_update(
+            &mut self,
+            _update: ResolverUpdate,
+            _config: &(),
+            channel_controller: &mut dyn ChannelController,
+        ) -> Result<(), String> {
+            let (subchannel, _) = channel_controller
+                .new_subchannel(&Address::default(), self.work_scheduler.route().clone());
+            self.subchannel = Some(subchannel);
+            Ok(())
+        }
+
+        fn work(
+            &mut self,
+            data: Option<WorkData>,
+            _channel_controller: &mut dyn ChannelController,
+        ) {
+            let update = data
+                .expect("expected work data")
+                .downcast::<SubchannelUpdate>()
+                .expect("expected a SubchannelUpdate");
+            assert!(Arc::ptr_eq(
+                &update.subchannel,
+                self.subchannel.as_ref().unwrap()
+            ));
+            self.states
+                .lock()
+                .unwrap()
+                .push(update.state.connectivity_state);
+        }
+
+        fn exit_idle(&mut self, _channel_controller: &mut dyn ChannelController) {}
+    }
+
+    // Tests that a policy below the root that intercepts new_subchannel can
+    // deliver updates for the intercepted subchannel to the policy that created
+    // it by calling into its child directly, without the work queue, and that
+    // the channel's own updates still reach that policy.
+    #[test]
+    fn intercepting_parent_delivers_to_child_directly() {
+        let (tx_events, rx_events) = mpsc::channel();
+        let (tx_work, rx_work) = mpsc::channel();
+        let mut tcc = TestChannelController {
+            tx_events,
+            tx_work: tx_work.clone(),
+        };
+        let states = Arc::new(Mutex::new(Vec::new()));
+
+        // The test acts as the root policy, with the Interceptor as its child,
+        // so the Interceptor is not at the root of the tree.
+        let options = LbPolicyOptions {
+            work_scheduler: TestWorkQueue::new_scheduler(tx_work),
+            runtime: default_runtime(),
+        };
+        let states_clone = states.clone();
+        let mut interceptor = Child::from_fn("interceptor", options, |options| {
+            Interceptor::new(options, states_clone)
+        });
+        interceptor
+            .resolver_update(ResolverUpdate::default(), &(), &mut tcc)
+            .unwrap();
+        let subchannel = match rx_events.try_recv() {
+            Ok(TestEvent::NewSubchannel(sc)) => sc,
+            other => panic!("expected NewSubchannel, got {other:?}"),
+        };
+
+        // The Interceptor delivers a state of its own directly.
+        let inject = ChildWorkItem {
+            handle: interceptor.handle.clone(),
+            data: Some(WorkData::new(Inject(SubchannelState::transient_failure(
+                "ejected",
+            )))),
+        };
+        interceptor
+            .try_work(WorkData::new(inject), &mut tcc)
+            .unwrap();
+        assert_eq!(
+            *states.lock().unwrap(),
+            vec![ConnectivityState::TransientFailure]
+        );
+        assert!(rx_work.try_recv().is_err(), "unexpected queued work");
+
+        // The channel's updates, wrapped by the full route, still arrive.
+        test_utils::schedule_subchannel_update(&subchannel, SubchannelState::ready());
+        let data = rx_work.try_recv().unwrap().unwrap();
+        interceptor.try_work(data, &mut tcc).unwrap();
+        assert_eq!(
+            *states.lock().unwrap(),
+            vec![
+                ConnectivityState::TransientFailure,
+                ConnectivityState::Ready
+            ]
+        );
     }
 }

@@ -62,6 +62,7 @@ use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkQueue;
+use crate::client::load_balancing::WorkRoute;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
@@ -571,14 +572,15 @@ impl ResolverChannelController {
         security_opts: SecurityOpts,
         config_selector: SharedConfigSelector,
     ) -> Self {
-        let lb_work_scheduler =
-            WorkScheduler::new_root(Arc::new(LbWorkQueue { wqtx: wqtx.clone() }));
+        let lb_work_queue: Arc<dyn WorkQueue> = Arc::new(LbWorkQueue { wqtx: wqtx.clone() });
+        let lb_work_scheduler = WorkScheduler::new_root(lb_work_queue.clone());
         let lb_channel_controller = LbChannelController {
             wqtx: wqtx.clone(),
             transport_registry: GLOBAL_TRANSPORT_REGISTRY.clone(),
             lb_watcher,
             runtime: runtime.clone(),
             security_opts,
+            lb_work_queue,
         };
         Self {
             lb_policy: SubchannelSharing::new(
@@ -641,13 +643,16 @@ struct LbChannelController {
     lb_watcher: Arc<Watcher<LbState>>,
     runtime: GrpcRuntime, // For creating subchannels
     security_opts: SecurityOpts,
+    /// The queue of work for the LB policy, which subchannels use to deliver
+    /// their state updates.
+    lb_work_queue: Arc<dyn WorkQueue>,
 }
 
 impl load_balancing::ChannelController for LbChannelController {
     fn new_subchannel(
         &mut self,
         address: &Address,
-        work_scheduler: WorkScheduler,
+        route: WorkRoute,
     ) -> (Arc<dyn Subchannel>, SubchannelState) {
         let transport = self
             .transport_registry
@@ -662,7 +667,7 @@ impl load_balancing::ChannelController for LbChannelController {
                 }),
                 self.runtime.clone(),
                 self.security_opts.clone(),
-                work_scheduler,
+                WorkScheduler::new(route, self.lb_work_queue.clone()),
             ),
             SubchannelState::idle(),
         )
@@ -890,6 +895,31 @@ mod tests {
             Arc::new(LocalChannelCredentials::new()),
         )
         .build()
+    }
+
+    // Tests that subchannel state changes reach the LB policy: the channel
+    // becomes READY once its subchannels connect.
+    #[tokio::test]
+    async fn channel_becomes_ready_when_subchannels_connect() {
+        crate::inmemory::reg();
+        let listener1 = crate::inmemory::InMemoryListener::new();
+        let listener2 = crate::inmemory::InMemoryListener::new();
+        let mut channel = Channel::builder(
+            format!("inmemory:///{},{}", listener1.id(), listener2.id()),
+            Arc::new(LocalChannelCredentials::new()),
+        )
+        .build();
+
+        channel.get_state(true);
+        let runtime = GrpcRuntime::default();
+        runtime
+            .timeout(Duration::from_secs(5), async {
+                while channel.get_state(false) != ConnectivityState::Ready {
+                    runtime.sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("channel did not become READY");
     }
 
     #[tokio::test]

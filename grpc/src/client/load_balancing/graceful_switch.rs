@@ -259,7 +259,7 @@ mod test {
             };
             for address in addresses {
                 let (sc, _state) =
-                    channel_controller.new_subchannel(address, work_scheduler.clone());
+                    channel_controller.new_subchannel(address, work_scheduler.route().clone());
                 scl.subchannels.push(sc.clone());
             }
             scl

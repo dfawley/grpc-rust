@@ -212,7 +212,7 @@ fn reg_stub(policy_name: &'static str) {
                 .and_then(|e| e.addresses.first())
                 .cloned()
                 .unwrap_or_default();
-            controller.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone());
+            controller.new_subchannel(&addr, data.lb_policy_options.work_scheduler.route().clone());
             Ok(())
         })),
         // Subchannel state changes are delivered as SubchannelUpdate work
@@ -845,7 +845,7 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
                 .and_then(|e| e.addresses.first())
                 .cloned()
                 .unwrap_or_default();
-            controller.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone());
+            controller.new_subchannel(&addr, data.lb_policy_options.work_scheduler.route().clone());
             // Schedule work from the child policy!
             data.lb_policy_options.work_scheduler.schedule_work(None);
             Ok(())
@@ -960,7 +960,8 @@ async fn exit_idle_wakes_only_current_priority() {
                     .and_then(|e| e.addresses.first())
                     .cloned()
                     .unwrap_or_default();
-                controller.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone());
+                controller
+                    .new_subchannel(&addr, data.lb_policy_options.work_scheduler.route().clone());
                 Ok(())
             })),
             work: Some(Arc::new(|_data, work_data, controller| {
