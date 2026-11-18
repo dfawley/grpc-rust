@@ -34,7 +34,6 @@
 //! them.  Use this when the children are a pure function of the most recent
 //! update (e.g. round robin, which creates one child per endpoint).
 
-use std::any::TypeId;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Debug;
@@ -169,12 +168,15 @@ impl<P: LbPolicy> Child<P> {
         data: WorkData,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), WorkData> {
-        debug_assert_eq!(data.type_id(), TypeId::of::<ChildWorkItem>());
-        let item = data.downcast::<ChildWorkItem>()?;
-        if item.handle != self.handle {
+        debug_assert!(data.is::<ChildWorkItem>());
+        match data.downcast_ref::<ChildWorkItem>() {
+            Some(item) if item.handle == self.handle => {}
             // This work item belongs to another child.
-            return Err(item);
+            _ => return Err(data),
         }
+        let item = data
+            .downcast::<ChildWorkItem>()
+            .expect("checked by downcast_ref");
         self.work_item(item.data, channel_controller);
         Ok(())
     }
@@ -503,7 +505,7 @@ struct ChildWorkScheduler {
 
 impl WorkScheduler for ChildWorkScheduler {
     fn schedule_work(&self, data: Option<WorkData>) {
-        let wrapped: Option<WorkData> = Some(Box::new(ChildWorkItem {
+        let wrapped: Option<WorkData> = Some(WorkData::new(ChildWorkItem {
             handle: self.handle.clone(),
             data,
         }));

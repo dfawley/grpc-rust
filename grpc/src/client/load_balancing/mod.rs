@@ -59,8 +59,6 @@ pub mod round_robin;
 pub mod subchannel;
 pub use registry::GLOBAL_LB_REGISTRY;
 pub use work::WorkData;
-#[allow(unused_imports)] // Public API, re-exported via __unstable.
-pub use work::WorkDataTrait;
 pub use work::WorkScheduler;
 
 #[cfg(any(test, feature = "__internal-test-utils"))]

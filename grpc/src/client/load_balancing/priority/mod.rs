@@ -286,7 +286,7 @@ impl Timer {
         let task_handle = rt.spawn(Box::pin(async move {
             rt_clone.sleep(duration).await;
             expired_clone.store(true, Ordering::Release);
-            work_scheduler.schedule_work(Some(Box::new(PriorityTimerWork)));
+            work_scheduler.schedule_work(Some(WorkData::new(PriorityTimerWork)));
         }));
         Timer {
             expired,
