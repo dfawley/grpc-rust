@@ -1,0 +1,28 @@
+[package]
+name = "grpc-health"
+version = "0.10.0"
+authors = ["gRPC authors"]
+license = "MIT"
+homepage = "https://grpc.io"
+repository = "https://github.com/grpc/grpc-rust"
+description = "Client-side health checking (grpc.health.v1) for the grpc crate"
+readme = "README.md"
+keywords = ["rpc", "grpc", "async", "health", "protobuf"]
+categories = ["web-programming", "network-programming", "asynchronous"]
+rust-version = { workspace = true }
+edition = "2024"
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = []
+
+[dependencies]
+grpc = { version = "0.10.0", path = "../grpc", default-features = false, features = ["__internal", "__unstable"] }
+grpc-protobuf = { version = "0.10.0", path = "../grpc-protobuf" }
+protobuf = "4.36.2-release"
+
+[dev-dependencies]
+grpc = { version = "0.10.0", path = "../grpc", features = ["__internal", "__unstable"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
+
+[build-dependencies]
+grpc-protobuf-build = { version = "0.10.0", path = "../grpc-protobuf-build", default-features = false }

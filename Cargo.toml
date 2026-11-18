@@ -13,6 +13,7 @@ members = [
   "grpc",
   "grpc-benchmark",
   "grpc-google-cloud-auth",
+  "grpc-health",
   "grpc-protobuf",
   "grpc-protobuf-build",
   "grpc-rustls",
