@@ -123,6 +123,10 @@ impl ForwardingSubchannel for TestSubchannel {
         self.address.clone()
     }
 
+    fn get_attribute_dyn(&self, _id: std::any::TypeId) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     fn connect(&self) {
         println!("connect called for subchannel {}", self.address);
         self.tx_connect

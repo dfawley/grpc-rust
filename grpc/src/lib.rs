@@ -126,6 +126,24 @@ pub mod __unstable {
 pub mod __internal {
     pub use crate::private::InternalToken;
     pub use crate::private::InternalTrait;
+
+    pub mod client {
+        pub mod load_balancing {
+            /// Subchannel producers: data published by a subchannel to the
+            /// LB policies that watch it.
+            pub mod producer {
+                pub use crate::client::load_balancing::producer::Producer;
+                pub use crate::client::load_balancing::producer::ProducerOptions;
+                pub use crate::client::load_balancing::producer::ProducerWatch;
+                pub use crate::client::load_balancing::producer::Publisher;
+                pub use crate::client::load_balancing::producer::SubchannelExt;
+                pub use crate::client::load_balancing::producer::WatchHandle;
+                pub use crate::client::load_balancing::producer::WatchId;
+                pub use crate::client::load_balancing::producer::WatchInterceptor;
+                pub use crate::client::load_balancing::producer::WatchUpdate;
+            }
+        }
+    }
 }
 
 /// These private types are only intended to be used in exported traits, where
