@@ -61,6 +61,7 @@ use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
 use crate::client::load_balancing::WorkData;
+use crate::client::load_balancing::WorkQueue;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
@@ -422,9 +423,7 @@ impl ActiveChannel {
                     }
                     WorkQueueItem::ResolveNow => resolver.resolve_now(),
                     WorkQueueItem::ScheduleLbPolicy(data) => {
-                        resolver_channel_controller
-                            .lb_policy
-                            .work(data, &mut resolver_channel_controller.lb_channel_controller);
+                        resolver_channel_controller.lb_work(data);
                     }
                 }
             }
@@ -560,7 +559,6 @@ struct ResolverChannelController {
     wqtx: WorkQueueTx, // To queue re-resolution requests
     runtime: GrpcRuntime,
     lb_policy: SubchannelSharing<GracefulSwitchPolicy>,
-    lb_work_scheduler: Arc<LbWorkScheduler>,
     lb_channel_controller: LbChannelController,
     config_selector: SharedConfigSelector,
 }
@@ -573,9 +571,10 @@ impl ResolverChannelController {
         security_opts: SecurityOpts,
         config_selector: SharedConfigSelector,
     ) -> Self {
-        let lb_work_scheduler = Arc::new(LbWorkScheduler { wqtx: wqtx.clone() });
+        let lb_work_scheduler =
+            WorkScheduler::new_root(Arc::new(LbWorkQueue { wqtx: wqtx.clone() }));
         let lb_channel_controller = LbChannelController {
-            lb_work_scheduler: lb_work_scheduler.clone(),
+            wqtx: wqtx.clone(),
             transport_registry: GLOBAL_TRANSPORT_REGISTRY.clone(),
             lb_watcher,
             runtime: runtime.clone(),
@@ -584,14 +583,18 @@ impl ResolverChannelController {
         Self {
             lb_policy: SubchannelSharing::new(
                 GracefulSwitchPolicy::new(runtime.clone(), lb_work_scheduler.clone()),
-                lb_work_scheduler.clone(),
+                lb_work_scheduler,
             ),
-            lb_work_scheduler,
             lb_channel_controller,
             wqtx: wqtx.clone(),
             runtime: runtime.clone(),
             config_selector,
         }
+    }
+
+    /// Calls the LB policy's work method with `data`.
+    fn lb_work(&mut self, data: Option<WorkData>) {
+        self.lb_policy.work(data, &mut self.lb_channel_controller);
     }
 }
 
@@ -633,7 +636,7 @@ impl name_resolution::ChannelController for ResolverChannelController {
 }
 
 struct LbChannelController {
-    lb_work_scheduler: Arc<LbWorkScheduler>,
+    wqtx: WorkQueueTx,                     // To queue re-resolution requests
     transport_registry: TransportRegistry, // For creating subchannels
     lb_watcher: Arc<Watcher<LbState>>,
     runtime: GrpcRuntime, // For creating subchannels
@@ -644,7 +647,7 @@ impl load_balancing::ChannelController for LbChannelController {
     fn new_subchannel(
         &mut self,
         address: &Address,
-        work_scheduler: Arc<dyn WorkScheduler>,
+        work_scheduler: WorkScheduler,
     ) -> (Arc<dyn Subchannel>, SubchannelState) {
         let transport = self
             .transport_registry
@@ -670,17 +673,17 @@ impl load_balancing::ChannelController for LbChannelController {
     }
 
     fn request_resolution(&mut self) {
-        _ = self.lb_work_scheduler.wqtx.send(WorkQueueItem::ResolveNow);
+        _ = self.wqtx.send(WorkQueueItem::ResolveNow);
     }
 }
 
 #[derive(Debug)]
-struct LbWorkScheduler {
+struct LbWorkQueue {
     wqtx: WorkQueueTx,
 }
 
-impl WorkScheduler for LbWorkScheduler {
-    fn schedule_work(&self, data: Option<WorkData>) {
+impl WorkQueue for LbWorkQueue {
+    fn enqueue(&self, data: Option<WorkData>) {
         _ = self.wqtx.send(WorkQueueItem::ScheduleLbPolicy(data));
     }
 }

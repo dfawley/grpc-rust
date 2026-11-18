@@ -253,7 +253,7 @@ pub(crate) struct InternalSubchannel {
 struct InternalSubchannelData {
     address: Address,
     state: InternalSubchannelState,
-    work_scheduler: Arc<dyn WorkScheduler>,
+    work_scheduler: WorkScheduler,
     on_drop: Arc<Notify>,
     transport_builder: ArcTransport,
     backoff: Arc<dyn Backoff>,
@@ -317,7 +317,7 @@ impl InternalSubchannel {
         backoff: Arc<dyn Backoff>,
         runtime: GrpcRuntime,
         mut security_opts: SecurityOpts,
-        work_scheduler: Arc<dyn WorkScheduler>,
+        work_scheduler: WorkScheduler,
     ) -> Arc<dyn Subchannel> {
         let on_drop = Arc::new(Notify::new());
         if let Some(proxy_opts) = ProxyOptions::from_addr(&address) {

@@ -45,6 +45,7 @@ use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::DynLbPolicy;
 use crate::client::load_balancing::DynLbPolicyBuilder;
+use crate::client::load_balancing::Hop;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
@@ -64,7 +65,7 @@ pub struct ChildManager<T: Debug, B: LbPolicyBuilder = Arc<DynLbPolicyBuilder>> 
     children: Vec<(T, Child<B::LbPolicy>)>,
     children_changed: bool,
     runtime: GrpcRuntime,
-    work_scheduler: Arc<dyn WorkScheduler>,
+    work_scheduler: WorkScheduler,
 }
 
 /// A wrapper around a single child LB policy.
@@ -108,10 +109,9 @@ impl<P: LbPolicy> Child<P> {
         build: impl FnOnce(LbPolicyOptions) -> P,
     ) -> Self {
         let handle = ChildHandle(Arc::new(()));
-        options.work_scheduler = Arc::new(ChildWorkScheduler {
-            work_scheduler: options.work_scheduler,
+        options.work_scheduler = options.work_scheduler.child(Arc::new(ChildHop {
             handle: handle.clone(),
-        });
+        }));
         let policy = build(options);
         Self {
             name,
@@ -240,7 +240,7 @@ where
 {
     /// Creates a new ChildManager LB policy.  shard_update is called whenever a
     /// resolver_update operation occurs.
-    pub fn new(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
+    pub fn new(runtime: GrpcRuntime, work_scheduler: WorkScheduler) -> Self {
         Self {
             handle_to_child_idx: Default::default(),
             children: Default::default(),
@@ -456,7 +456,7 @@ impl ChannelController for WrappedController<'_> {
     fn new_subchannel(
         &mut self,
         address: &Address,
-        work_scheduler: Arc<dyn WorkScheduler>,
+        work_scheduler: WorkScheduler,
     ) -> (Arc<dyn Subchannel>, SubchannelState) {
         self.channel_controller
             .new_subchannel(address, work_scheduler)
@@ -497,19 +497,18 @@ struct ChildWorkItem {
     data: Option<WorkData>,
 }
 
+/// The hop to one child: wraps its work in a [`ChildWorkItem`].
 #[derive(Debug)]
-struct ChildWorkScheduler {
-    work_scheduler: Arc<dyn WorkScheduler>, // The real work scheduler of the channel.
+struct ChildHop {
     handle: ChildHandle,
 }
 
-impl WorkScheduler for ChildWorkScheduler {
-    fn schedule_work(&self, data: Option<WorkData>) {
-        let wrapped: Option<WorkData> = Some(WorkData::new(ChildWorkItem {
+impl Hop for ChildHop {
+    fn wrap(&self, data: Option<WorkData>) -> Option<WorkData> {
+        Some(WorkData::new(ChildWorkItem {
             handle: self.handle.clone(),
             data,
-        }));
-        self.work_scheduler.schedule_work(wrapped);
+        }))
     }
 }
 
@@ -538,7 +537,7 @@ mod test {
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEnv;
     use crate::client::load_balancing::test_utils::TestEvent;
-    use crate::client::load_balancing::test_utils::TestWorkScheduler;
+    use crate::client::load_balancing::test_utils::TestWorkQueue;
     use crate::client::name_resolution::Endpoint;
     use crate::client::name_resolution::ResolverUpdate;
     use crate::core::Address;
@@ -850,7 +849,7 @@ mod test {
 
         let names = [name1, name2];
         let mut child_manager =
-            ChildManager::new(default_runtime(), Arc::new(TestWorkScheduler { tx_work }));
+            ChildManager::new(default_runtime(), TestWorkQueue::new_scheduler(tx_work));
 
         // Request that child one requests work.
         let cfg = Arc::new(Mutex::new(HashMap::<&'static str, ()>::new())) as DynLbConfig;

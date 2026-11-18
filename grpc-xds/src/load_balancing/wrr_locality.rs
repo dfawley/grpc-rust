@@ -120,7 +120,7 @@ impl LbPolicyBuilder for WrrLocalityBuilder {
 struct WrrLocalityPolicy {
     child: Option<(Child, ParsedLbConfig)>,
     runtime: GrpcRuntime,
-    work_scheduler: Arc<dyn WorkScheduler>,
+    work_scheduler: WorkScheduler,
     child_policy_name: &'static str,
 }
 

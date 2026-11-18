@@ -30,6 +30,7 @@ use std::sync::Arc;
 use crate::StatusCodeError;
 use crate::StatusError;
 use crate::client::load_balancing::ChannelController;
+use crate::client::load_balancing::Hop;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickOptions;
@@ -54,12 +55,12 @@ pub(crate) struct SubchannelSharing<T> {
     delegate: T,
     /// Routes work back into this policy's `work` method.  Everything that
     /// needs to touch `inner` from another thread goes through here instead.
-    work_scheduler: Arc<dyn WorkScheduler>,
+    work_scheduler: WorkScheduler,
     inner: Inner,
 }
 
 impl<T> SubchannelSharing<T> {
-    pub(crate) fn new(delegate: T, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
+    pub(crate) fn new(delegate: T, work_scheduler: WorkScheduler) -> Self {
         Self {
             delegate,
             work_scheduler,
@@ -137,12 +138,12 @@ struct InternalSubchannelEntry {
     state: SubchannelState,
     /// The external subchannels backed by this internal subchannel, along with
     /// the WorkScheduler used to deliver updates about each of them.
-    ext_subchannels: HashMap<WeakSubchannel, Arc<dyn WorkScheduler>>,
+    ext_subchannels: HashMap<WeakSubchannel, WorkScheduler>,
 }
 
 #[derive(Debug)]
 enum SharingWork {
-    /// A state change of an internal subchannel, from SubchannelUpdateForwarder.
+    /// A state change of an internal subchannel, via SubchannelUpdateHop.
     InternalUpdate(SubchannelUpdate),
     /// An external subchannel was dropped, from SharedSubchannel::drop.
     Released(Arc<dyn Subchannel>),
@@ -205,7 +206,7 @@ struct SharedSubchannel {
     delegate: Arc<dyn Subchannel>,
     /// Routes work back into the SubchannelSharing policy, used to report that
     /// this subchannel has been dropped.
-    work_scheduler: Arc<dyn WorkScheduler>,
+    work_scheduler: WorkScheduler,
 }
 
 impl PartialEq for SharedSubchannel {
@@ -241,20 +242,19 @@ impl Drop for SharedSubchannel {
     }
 }
 
-/// The WorkScheduler given to the channel for every internal subchannel.
+/// The hop below the SubchannelSharing policy's route in the WorkScheduler
+/// given to the channel for every internal subchannel.
 ///
-/// The channel may call this from any thread, and even before `new_subchannel`
+/// The channel may use this from any thread, and even before `new_subchannel`
 /// has returned, i.e. before the subchannel has been registered.  So it does no
-/// work itself: it just asks for the update to be redelivered to the
-/// SubchannelSharing policy's `work` method, where the registration is
-/// guaranteed to be complete and the maps can be accessed without locking.
+/// work itself: it addresses the update to the SubchannelSharing policy's
+/// `work` method, where the registration is guaranteed to be complete and the
+/// maps can be accessed without locking.
 #[derive(Debug)]
-struct SubchannelUpdateForwarder {
-    work_scheduler: Arc<dyn WorkScheduler>,
-}
+struct SubchannelUpdateHop;
 
-impl WorkScheduler for SubchannelUpdateForwarder {
-    fn schedule_work(&self, data: Option<WorkData>) {
+impl Hop for SubchannelUpdateHop {
+    fn wrap(&self, data: Option<WorkData>) -> Option<WorkData> {
         let update = match data.map(|data| data.downcast::<SubchannelUpdate>()) {
             Some(Ok(update)) => update,
             other => {
@@ -262,11 +262,10 @@ impl WorkScheduler for SubchannelUpdateForwarder {
                     false,
                     "subchannel scheduled work with {other:?}; expected a SubchannelUpdate"
                 );
-                return;
+                return None;
             }
         };
-        self.work_scheduler
-            .schedule_work(Some(WorkData::new(SharingWork::InternalUpdate(update))));
+        Some(WorkData::new(SharingWork::InternalUpdate(update)))
     }
 }
 
@@ -274,7 +273,7 @@ struct SharingChannelController<'a> {
     inner: &'a mut Inner,
     /// Routes work back into the SubchannelSharing policy.  Handed to every
     /// subchannel this controller creates.
-    work_scheduler: &'a Arc<dyn WorkScheduler>,
+    work_scheduler: &'a WorkScheduler,
     delegate: &'a mut dyn ChannelController,
 }
 
@@ -282,7 +281,7 @@ impl ChannelController for SharingChannelController<'_> {
     fn new_subchannel(
         &mut self,
         address: &Address,
-        work_scheduler: Arc<dyn WorkScheduler>,
+        work_scheduler: WorkScheduler,
     ) -> (Arc<dyn Subchannel>, SubchannelState) {
         // Find the existing internal subchannel with this address, if any.
         let existing = self.inner.subchannels_by_address.get(address).cloned();
@@ -292,14 +291,11 @@ impl ChannelController for SharingChannelController<'_> {
             None => {
                 // Create a new internal subchannel.  The channel may report a
                 // state for it before this call even returns, but that update
-                // is only queued by the SubchannelUpdateForwarder; it is not
-                // processed until `work` is called, by which time the
-                // registration below has completed.
+                // is only queued; it is not processed until `work` is called,
+                // by which time the registration below has completed.
                 let (int_subchannel, state) = self.delegate.new_subchannel(
                     address,
-                    Arc::new(SubchannelUpdateForwarder {
-                        work_scheduler: self.work_scheduler.clone(),
-                    }),
+                    self.work_scheduler.child(Arc::new(SubchannelUpdateHop)),
                 );
                 self.inner
                     .subchannels_by_address
@@ -398,7 +394,7 @@ mod tests {
     use crate::client::load_balancing::test_utils::TestEnv;
     use crate::client::load_balancing::test_utils::TestEvent;
     use crate::client::load_balancing::test_utils::TestSubchannel;
-    use crate::client::load_balancing::test_utils::TestWorkScheduler;
+    use crate::client::load_balancing::test_utils::TestWorkQueue;
     use crate::client::load_balancing::test_utils::new_request_headers;
     use crate::client::load_balancing::test_utils::run_pending_work;
     use crate::client::name_resolution::ResolverUpdate;
@@ -823,7 +819,7 @@ mod tests {
     // new_subchannel.
     #[test]
     fn test_new_subchannel_state() {
-        type WorkFn = Box<dyn FnOnce(&mut dyn ChannelController, Arc<dyn WorkScheduler>) + Send>;
+        type WorkFn = Box<dyn FnOnce(&mut dyn ChannelController, WorkScheduler) + Send>;
         let (tx_work, rx_work) = mpsc::channel::<WorkFn>();
         // Wrap rx_work in a mutex to allow the stub work Fn() closure to access
         // it mutably.
@@ -911,7 +907,7 @@ mod tests {
         fn new_subchannel(
             &mut self,
             address: &Address,
-            work_scheduler: Arc<dyn WorkScheduler>,
+            work_scheduler: WorkScheduler,
         ) -> (Arc<dyn Subchannel>, SubchannelState) {
             let subchannel: Arc<dyn Subchannel> =
                 Arc::new(TestSubchannel::new_with_work_scheduler(
@@ -955,7 +951,7 @@ mod tests {
         let sc_out = Arc::new(Mutex::new(None));
         let sc_out_clone = sc_out.clone();
 
-        let work_scheduler = Arc::new(TestWorkScheduler { tx_work });
+        let work_scheduler = TestWorkQueue::new_scheduler(tx_work);
         let mock = StubPolicy::new(
             StubPolicyFuncs {
                 work: Some(Arc::new(move |data, work_item, cc| {

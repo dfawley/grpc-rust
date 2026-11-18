@@ -48,6 +48,7 @@ use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
+use crate::client::load_balancing::WorkQueue;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::ForwardingSubchannel;
 use crate::client::load_balancing::subchannel::SubchannelUpdate;
@@ -68,7 +69,7 @@ pub struct TestSubchannel {
     // The work scheduler provided by the policy that created this subchannel,
     // used to deliver state updates about it.  None for subchannels that were
     // not created through a TestChannelController.
-    work_scheduler: Option<Arc<dyn WorkScheduler>>,
+    work_scheduler: Option<WorkScheduler>,
 }
 
 impl TestSubchannel {
@@ -83,7 +84,7 @@ impl TestSubchannel {
     pub fn new_with_work_scheduler(
         address: Address,
         tx_connect: mpsc::Sender<TestEvent>,
-        work_scheduler: Arc<dyn WorkScheduler>,
+        work_scheduler: WorkScheduler,
     ) -> Self {
         Self {
             address,
@@ -175,7 +176,7 @@ impl ChannelController for TestChannelController {
     fn new_subchannel(
         &mut self,
         address: &Address,
-        work_scheduler: Arc<dyn WorkScheduler>,
+        work_scheduler: WorkScheduler,
     ) -> (Arc<dyn Subchannel>, SubchannelState) {
         println!("new_subchannel called for address {}", address);
         let subchannel: Arc<dyn Subchannel> = Arc::new(TestSubchannel::new_with_work_scheduler(
@@ -200,12 +201,25 @@ impl ChannelController for TestChannelController {
 }
 
 #[derive(Debug)]
-pub struct TestWorkScheduler {
+pub struct TestWorkQueue {
     pub tx_work: mpsc::Sender<Option<WorkData>>,
 }
 
-impl WorkScheduler for TestWorkScheduler {
-    fn schedule_work(&self, data: Option<WorkData>) {
+impl TestWorkQueue {
+    /// Returns a root WorkScheduler whose work is sent to `tx_work`.
+    pub fn new_scheduler(tx_work: mpsc::Sender<Option<WorkData>>) -> WorkScheduler {
+        new_root_work_scheduler(Arc::new(TestWorkQueue { tx_work }))
+    }
+}
+
+/// Returns a WorkScheduler for a root policy whose work is queued on `queue`,
+/// for tests that run a policy without a channel.
+pub fn new_root_work_scheduler(queue: Arc<dyn WorkQueue>) -> WorkScheduler {
+    WorkScheduler::new_root(queue)
+}
+
+impl WorkQueue for TestWorkQueue {
+    fn enqueue(&self, data: Option<WorkData>) {
         // Subchannels schedule work when they are dropped, which can happen
         // after the test has stopped listening.  Ignore the error rather than
         // panicking inside a Drop impl.
@@ -247,10 +261,10 @@ pub struct TestEnv<P> {
 impl<P> TestEnv<P> {
     /// Creates the test environment using a LbPolicyBuilder-like closure for
     /// policies that don't implement LbPolicyBuilder.
-    pub fn new(build_policy: impl FnOnce(Arc<dyn WorkScheduler>) -> P) -> Self {
+    pub fn new(build_policy: impl FnOnce(WorkScheduler) -> P) -> Self {
         let (tx_events, rx_events) = mpsc::channel::<TestEvent>();
         let (tx_work, rx_work) = mpsc::channel::<Option<WorkData>>();
-        let work_scheduler = Arc::new(TestWorkScheduler { tx_work });
+        let work_scheduler = TestWorkQueue::new_scheduler(tx_work);
         Self {
             policy: build_policy(work_scheduler),
             tcc: TestChannelController { tx_events },

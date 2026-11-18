@@ -279,7 +279,7 @@ impl Drop for Timer {
 impl Timer {
     /// Spawns a new timer for the given duration that schedules work on
     /// completion.
-    fn new(duration: Duration, work_scheduler: Arc<dyn WorkScheduler>, rt: GrpcRuntime) -> Timer {
+    fn new(duration: Duration, work_scheduler: WorkScheduler, rt: GrpcRuntime) -> Timer {
         let rt_clone = rt.clone();
         let expired = Arc::new(AtomicBool::new(false));
         let expired_clone = expired.clone();
@@ -345,7 +345,7 @@ impl ChildState {
     /// is connecting.
     fn from_connectivity_state(
         connectivity_state: ConnectivityState,
-        work_scheduler: &Arc<dyn WorkScheduler>,
+        work_scheduler: &WorkScheduler,
         rt: &GrpcRuntime,
     ) -> Self {
         match connectivity_state {
@@ -365,7 +365,7 @@ impl ChildState {
     fn update(
         &mut self,
         connectivity_state: ConnectivityState,
-        work_scheduler: &Arc<dyn WorkScheduler>,
+        work_scheduler: &WorkScheduler,
         rt: &GrpcRuntime,
     ) {
         match (&*self, connectivity_state) {
@@ -438,7 +438,7 @@ struct PriorityPolicy {
     /// child events do not change the active picker.
     published_lb_state: Option<LbState>,
     rt: GrpcRuntime,
-    work_scheduler: Arc<dyn WorkScheduler>,
+    work_scheduler: WorkScheduler,
 }
 
 impl LbPolicy for PriorityPolicy {
@@ -575,7 +575,7 @@ impl CreatedChild {
     /// Updates `state` to reflect the connectivity state most recently
     /// reported by the child policy and the state of its failover timer.
     /// Starts a failover timer if the child starts connecting.
-    fn update_state(&mut self, work_scheduler: &Arc<dyn WorkScheduler>, rt: &GrpcRuntime) {
+    fn update_state(&mut self, work_scheduler: &WorkScheduler, rt: &GrpcRuntime) {
         self.state
             .update(self.policy.state().connectivity_state, work_scheduler, rt);
     }

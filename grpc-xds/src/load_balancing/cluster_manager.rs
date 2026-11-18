@@ -222,10 +222,12 @@ mod tests {
     use std::sync::Mutex;
 
     use grpc::__unstable::client::load_balancing::GLOBAL_LB_REGISTRY;
+    use grpc::__unstable::client::load_balancing::WorkQueue;
     use grpc::__unstable::client::load_balancing::WorkScheduler;
     use grpc::__unstable::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
     use grpc::__unstable::client::load_balancing::subchannel::Subchannel;
     use grpc::__unstable::client::load_balancing::subchannel::SubchannelState;
+    use grpc::__unstable::client::load_balancing::test_utils;
     use grpc::__unstable::client::name_resolution::Endpoint;
     use grpc::__unstable::rt::default_runtime;
     use grpc::client::CallOptions;
@@ -461,7 +463,7 @@ mod tests {
         GLOBAL_LB_REGISTRY.add_builder(TestDummyLbBuilder);
         let scheduler = Arc::new(MockScheduler::default());
         let policy = ClusterManagerBuilder.build(LbPolicyOptions {
-            work_scheduler: scheduler.clone(),
+            work_scheduler: test_utils::new_root_work_scheduler(scheduler.clone()),
             runtime: default_runtime(),
         });
         let controller = MockChannelController { latest_state: None };
@@ -553,8 +555,8 @@ mod tests {
         queued_work: Mutex<Vec<Option<WorkData>>>,
     }
 
-    impl WorkScheduler for MockScheduler {
-        fn schedule_work(&self, data: Option<WorkData>) {
+    impl WorkQueue for MockScheduler {
+        fn enqueue(&self, data: Option<WorkData>) {
             self.queued_work.lock().unwrap().push(data);
         }
     }
@@ -567,7 +569,7 @@ mod tests {
         fn new_subchannel(
             &mut self,
             _address: &Address,
-            _work_scheduler: Arc<dyn WorkScheduler>,
+            _work_scheduler: WorkScheduler,
         ) -> (Arc<dyn Subchannel>, SubchannelState) {
             unimplemented!()
         }
@@ -593,7 +595,7 @@ mod tests {
 
     #[derive(Debug)]
     struct TestDummyLbPolicy {
-        work_scheduler: Arc<dyn WorkScheduler>,
+        work_scheduler: WorkScheduler,
         tag: String,
         endpoints: Vec<Endpoint>,
     }

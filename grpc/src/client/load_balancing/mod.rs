@@ -58,7 +58,11 @@ pub mod registry;
 pub mod round_robin;
 pub mod subchannel;
 pub use registry::GLOBAL_LB_REGISTRY;
+pub use work::Hop;
 pub use work::WorkData;
+pub use work::WorkQueue;
+#[allow(unused_imports)] // Public API, re-exported via __unstable.
+pub use work::WorkRoute;
 pub use work::WorkScheduler;
 
 #[cfg(any(test, feature = "__internal-test-utils"))]
@@ -143,7 +147,7 @@ pub trait LbPolicy: Send + Sync + Debug + 'static {
 pub struct LbPolicyOptions {
     /// A hook into the channel's work scheduler that allows the LbPolicy to
     /// request the ability to perform operations on the ChannelController.
-    pub work_scheduler: Arc<dyn WorkScheduler>,
+    pub work_scheduler: WorkScheduler,
     pub runtime: GrpcRuntime,
 }
 
@@ -292,7 +296,7 @@ pub trait ChannelController: Send + Sync {
     fn new_subchannel(
         &mut self,
         address: &Address,
-        work_scheduler: Arc<dyn WorkScheduler>,
+        work_scheduler: WorkScheduler,
     ) -> (Arc<dyn Subchannel>, SubchannelState);
 
     /// Provides a new snapshot of the LB policy's state to the channel.

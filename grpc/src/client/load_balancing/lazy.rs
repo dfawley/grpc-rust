@@ -156,12 +156,12 @@ where
 /// to wake up the wrapped delegate policy) and queues every RPC.
 #[derive(Debug)]
 pub struct WakeUpPicker {
-    work_scheduler: Arc<dyn WorkScheduler>,
+    work_scheduler: WorkScheduler,
     triggered_work: AtomicBool,
 }
 
 impl WakeUpPicker {
-    fn new(work_scheduler: Arc<dyn WorkScheduler>) -> Self {
+    fn new(work_scheduler: WorkScheduler) -> Self {
         Self {
             work_scheduler,
             triggered_work: AtomicBool::new(false),

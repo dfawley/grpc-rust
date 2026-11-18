@@ -109,7 +109,7 @@ pub(crate) fn reg() {
 }
 
 pub(crate) struct PickFirstPolicy {
-    work_scheduler: Arc<dyn WorkScheduler>,
+    work_scheduler: WorkScheduler,
     runtime: GrpcRuntime,
     connectivity_state: ConnectivityState,
 
@@ -649,7 +649,7 @@ struct Timer {
 
 impl Timer {
     /// Starts a new timer, returning it.
-    fn start(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
+    fn start(runtime: GrpcRuntime, work_scheduler: WorkScheduler) -> Self {
         let expired = Arc::new(AtomicBool::new(false));
         let expired_clone = expired.clone();
         let handle = runtime.clone().spawn(Box::pin(async move {
@@ -690,11 +690,11 @@ impl Picker for OneSubchannelPicker {
 #[derive(Debug)]
 struct IdlePicker {
     triggered_work: AtomicBool,
-    work_scheduler: Arc<dyn WorkScheduler>,
+    work_scheduler: WorkScheduler,
 }
 
 impl IdlePicker {
-    fn new(work_scheduler: Arc<dyn WorkScheduler>) -> Self {
+    fn new(work_scheduler: WorkScheduler) -> Self {
         Self {
             triggered_work: AtomicBool::new(false),
             work_scheduler,

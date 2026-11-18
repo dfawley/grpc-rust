@@ -67,7 +67,7 @@ pub struct GracefulSwitchPolicy {
     active: Option<Child>,
     pending: Option<Child>,
     runtime: GrpcRuntime,
-    work_scheduler: Arc<dyn WorkScheduler>,
+    work_scheduler: WorkScheduler,
 }
 
 impl LbPolicy for GracefulSwitchPolicy {
@@ -148,7 +148,7 @@ impl LbPolicy for GracefulSwitchPolicy {
 
 impl GracefulSwitchPolicy {
     /// Creates a new Graceful Switch policy.
-    pub fn new(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
+    pub fn new(runtime: GrpcRuntime, work_scheduler: WorkScheduler) -> Self {
         GracefulSwitchPolicy {
             active: None,
             pending: None,
@@ -252,7 +252,7 @@ mod test {
         fn new(
             addresses: &Vec<Address>,
             channel_controller: &mut dyn ChannelController,
-            work_scheduler: Arc<dyn WorkScheduler>,
+            work_scheduler: WorkScheduler,
         ) -> Self {
             let mut scl = TestSubchannelList {
                 subchannels: Vec::new(),
