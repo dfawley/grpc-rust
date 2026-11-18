@@ -142,6 +142,16 @@ pub mod __internal {
                 pub use crate::client::load_balancing::producer::WatchInterceptor;
                 pub use crate::client::load_balancing::producer::WatchUpdate;
             }
+            /// Client-side health checking.
+            pub mod health {
+                pub use crate::client::load_balancing::health::HealthProducer;
+                pub use crate::client::load_balancing::health::HealthReporter;
+                pub use crate::client::load_balancing::health::HealthState;
+                pub use crate::client::load_balancing::health::HealthWatch;
+                pub use crate::client::load_balancing::health::HealthWatchClient;
+                pub use crate::client::load_balancing::health::ServingStatus;
+                pub use crate::client::load_balancing::health::set_health_watch_client;
+            }
         }
     }
 }

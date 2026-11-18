@@ -45,7 +45,7 @@ use crate::client::service_config::ServiceConfig;
 use crate::core::Address;
 use crate::rt::GrpcRuntime;
 
-mod backoff;
+pub(crate) mod backoff;
 pub mod config_selector;
 pub mod registry;
 

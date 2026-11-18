@@ -42,6 +42,7 @@ use crate::core::Address;
 use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 
+pub(crate) mod health;
 pub(crate) mod producer;
 pub(crate) mod subchannel_sharing;
 pub(crate) mod weighted_target;
