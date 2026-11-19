@@ -21,23 +21,26 @@ gRPC!
 
 - `grpc` (this crate): The core gRPC implementation.
 - [`grpc-tokio`]: Tokio runtime support.
-- [`protoc-gen-grpc-rust`]: The protobuf code generator binary, used with [`protoc`].
+- [`protoc-gen-grpc-rust`]: The protobuf code generator, used with [`protoc`].
 - [`grpc-protobuf-build`]: Build integration for grpc protobuf code generation.
 - [`grpc-protobuf`]: Implementation of protobuf-over-grpc used by the generated code.
 
 ## License
 
-This project is licensed under the [MIT license](../LICENSE) and/or the [`Apache
-license 2.0`](https://www.apache.org/licenses/LICENSE-2.0.txt).
+This project is licensed under the [MIT license] and/or the
+[`Apache license 2.0`].
 
 ### Contributing
 
 If you'd like to contribute, please see our project's
-[`CONTRIBUTING.md`](../CONTRIBUTING.md) for some guidelines.
+[`CONTRIBUTING.md`] for some guidelines.
 
+[MIT license]: https://github.com/grpc/grpc-rust/blob/master/LICENSE
+[`Apache license 2.0`]: https://www.apache.org/licenses/LICENSE-2.0.txt
+[`CONTRIBUTING.md`]: https://github.com/grpc/grpc-rust/blob/master/CONTRIBUTING.md
 [gRPC]: https://grpc.io
 [`protoc`]: https://protobuf.dev/installation/
-[`protoc-gen-grpc-rust`]: ../protoc-gen-grpc-rust
-[`grpc-protobuf-build`]: ../grpc-protobuf-build
-[`grpc-tokio`]: ../grpc-tokio
-[`grpc-protobuf`]: ../grpc-protobuf
+[`protoc-gen-grpc-rust`]: https://docs.rs/protoc-gen-grpc-rust
+[`grpc-protobuf-build`]: https://docs.rs/grpc-protobuf-build
+[`grpc-tokio`]: https://docs.rs/grpc-tokio
+[`grpc-protobuf`]: https://docs.rs/grpc-protobuf

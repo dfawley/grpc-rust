@@ -1,10 +1,9 @@
 # grpc-tokio
 
-[Tokio](https://tokio.rs) runtime support for [`grpc`](../grpc).
+[Tokio](https://tokio.rs) runtime support for [`grpc`](https://docs.rs/grpc).
 
-The `grpc` crate is runtime-agnostic. This crate provides the runtime used for
-I/O, timers, DNS resolution, and task spawning when running on Tokio, along
-with functions to create Tokio-backed channels and servers:
+The `grpc` crate is runtime-agnostic. This crate provides a Tokio-compatible
+runtime and helper functions to create Tokio-backed channels and servers:
 
 ```rust,ignore
 let channel = grpc_tokio::channel_builder(target, credentials).build();
@@ -23,5 +22,8 @@ let listener = grpc_tokio::tcp_listener(addr, creds, config).await?;
 
 ## License
 
-This project is licensed under the [MIT license](../LICENSE) and/or the [`Apache
-license 2.0`](https://www.apache.org/licenses/LICENSE-2.0.txt).
+This project is licensed under the [MIT license] and/or the [`Apache license
+2.0`].
+
+[MIT license]: https://github.com/grpc/grpc-rust/blob/master/LICENSE
+[`Apache license 2.0`]: https://www.apache.org/licenses/LICENSE-2.0.txt
