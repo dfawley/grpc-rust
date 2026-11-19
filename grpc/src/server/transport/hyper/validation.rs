@@ -265,7 +265,7 @@ mod tests {
     use crate::core::Address;
     use crate::credentials::SecurityInfo;
     use crate::credentials::SecurityLevel;
-    use crate::rt::GrpcRuntime;
+    use crate::rt::default_runtime;
 
     fn test_connection_info() -> ConnectionInfo {
         let addr = Address {
@@ -489,7 +489,7 @@ mod tests {
             .unwrap()
             .into_parts();
 
-        let now = GrpcRuntime::default().now();
+        let now = default_runtime().now();
         let headers = extract_request_headers(&parts, test_connection_info(), now).unwrap();
         assert_eq!(headers.method_name(), "/test.Service/InspectHeaders");
         assert_eq!(headers.deadline(), Some(now + Duration::from_secs(5)));
@@ -535,7 +535,7 @@ mod tests {
             .into_parts();
 
         let headers =
-            extract_request_headers(&parts, test_connection_info(), GrpcRuntime::default().now())
+            extract_request_headers(&parts, test_connection_info(), default_runtime().now())
                 .unwrap();
         assert_eq!(headers.method_name(), "/test.Service/Minimal");
         assert_eq!(headers.deadline(), None);
@@ -554,9 +554,8 @@ mod tests {
             .unwrap()
             .into_parts();
 
-        let err =
-            extract_request_headers(&parts, test_connection_info(), GrpcRuntime::default().now())
-                .unwrap_err();
+        let err = extract_request_headers(&parts, test_connection_info(), default_runtime().now())
+            .unwrap_err();
         assert_eq!(err.http_status, Some(StatusCode::METHOD_NOT_ALLOWED));
         assert_eq!(err.grpc_status.code(), StatusCodeError::Internal);
     }
@@ -572,9 +571,8 @@ mod tests {
             .unwrap()
             .into_parts();
 
-        let err =
-            extract_request_headers(&parts, test_connection_info(), GrpcRuntime::default().now())
-                .unwrap_err();
+        let err = extract_request_headers(&parts, test_connection_info(), default_runtime().now())
+            .unwrap_err();
         assert_eq!(err.http_status, None);
         assert_eq!(err.grpc_status.code(), StatusCodeError::Internal);
         assert!(
@@ -599,9 +597,8 @@ mod tests {
             .unwrap()
             .into_parts();
 
-        let err =
-            extract_request_headers(&parts, test_connection_info(), GrpcRuntime::default().now())
-                .unwrap_err();
+        let err = extract_request_headers(&parts, test_connection_info(), default_runtime().now())
+            .unwrap_err();
         assert_eq!(err.http_status, None);
         assert_eq!(err.grpc_status.code(), StatusCodeError::Internal);
         assert_eq!(

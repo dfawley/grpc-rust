@@ -34,7 +34,6 @@ mod generated {
 use std::env;
 use std::sync::Arc;
 
-use grpc::client::Channel;
 use grpc::client::Invoke;
 use grpc::credentials::LocalChannelCredentials;
 use tokio::task;
@@ -203,7 +202,7 @@ async fn main() {
     println!("Connecting to {address}...");
 
     // Create a new gRPC channel:
-    let channel = Channel::builder(
+    let channel = grpc_tokio::channel_builder(
         format!("dns:///{address}"),
         Arc::new(LocalChannelCredentials::new()),
     )

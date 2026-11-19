@@ -26,7 +26,6 @@ use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 
-use grpc::client::Channel;
 use grpc::credentials::LocalChannelCredentials;
 use grpc_benchmark::generated::grpc::testing::ClientArgs;
 use grpc_benchmark::generated::grpc::testing::ClientConfig;
@@ -182,7 +181,7 @@ async fn main() {
     });
 
     // Create Worker Client.
-    let channel = Channel::builder(
+    let channel = grpc_tokio::channel_builder(
         format!("dns:///127.0.0.1:{}", worker_port),
         LocalChannelCredentials::new_arc(),
     )

@@ -100,7 +100,9 @@ impl ChannelCredentials for InsecureChannelCredentials {
 mod tests {
     use grpc::__unstable::rt;
     use grpc::__unstable::rt::EndpointIoStream;
+    use grpc::__unstable::rt::Runtime as _;
     use grpc::__unstable::rt::TcpOptions;
+    use grpc_tokio::TokioRuntime;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
@@ -116,8 +118,8 @@ mod tests {
         let server_addr = listener.local_addr().unwrap();
         let authority = Authority::new("example.com", Some(server_addr.port()));
 
-        let runtime = rt::default_runtime();
-        let endpoint = runtime
+        let runtime = grpc_tokio::runtime();
+        let endpoint = TokioRuntime::new()
             .tcp_stream(server_addr, TcpOptions::default())
             .await
             .unwrap();

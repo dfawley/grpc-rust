@@ -232,7 +232,7 @@ struct FakeDns {
 #[crate::async_trait]
 impl rt::DnsResolver for FakeDns {
     async fn lookup_host_name(&self, _: &str) -> Result<Vec<std::net::IpAddr>, String> {
-        GrpcRuntime::default().sleep(self.latency).await;
+        default_runtime().sleep(self.latency).await;
         self.lookup_result.clone()
     }
 
@@ -391,7 +391,7 @@ pub(crate) async fn rate_limit() {
             _ = work_rx.recv() => {
                 panic!("Received unexpected work request from resolver");
             }
-            _ = GrpcRuntime::default().sleep(DEFAULT_TEST_SHORT_TIMEOUT) => {
+            _ = default_runtime().sleep(DEFAULT_TEST_SHORT_TIMEOUT) => {
                 println!("No work requested from resolver.");
             }
         };
@@ -488,7 +488,7 @@ pub(crate) async fn backoff_on_error() {
         _ = work_rx.recv() => {
             panic!("Received unexpected work request from resolver.");
         }
-        _ = GrpcRuntime::default().sleep(DEFAULT_TEST_SHORT_TIMEOUT) => {
+        _ = default_runtime().sleep(DEFAULT_TEST_SHORT_TIMEOUT) => {
             println!("No event received from resolver.");
         }
     };
